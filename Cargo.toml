@@ -1,0 +1,25 @@
+[package]
+name = "byreal-clmm-jupiter-integration"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Solana dependencies
+anchor-lang = "0.31.0"
+anyhow = "1.0.97"
+solana-sdk = "2.2.2"
+spl-token = "8.0.0"
+anchor-spl = "0.31.0"
+
+# Jupiter dependencies
+jupiter-amm-interface = "0.5.1"
+
+# Raydium dependencies
+byreal-clmm = { git = "https://github.com/wanggeng01041454/raydium-clmm.git", branch = "gerik_dev" }
+
+[dev-dependencies]
+solana-client = "2.2.2"
+
+[features]
+mainnet = []
+devnet = []
