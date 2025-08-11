@@ -15,6 +15,7 @@ use byreal_clmm::{
         MAX_SQRT_PRICE_X64, MIN_SQRT_PRICE_X64
     },
 };
+use byreal_clmm::libraries::MulDiv;
 use byreal_clmm::states::{POOL_TICK_ARRAY_BITMAP_SEED, TICK_ARRAY_SEED};
 
 // Program IDs
@@ -31,6 +32,62 @@ pub const BYREAL_CLMM_PROGRAM: Pubkey = solana_sdk::pubkey!("45iBNkaENereLKMjLm2
 const TICK_ARRAY_SIZE: i32 = 60;
 const MAX_TICK_ARRAY_CROSSINGS: usize = 10;
 
+/// Extended pool state with decay fee fields parsed from padding
+#[derive(Clone, Default)]
+struct PoolStateExt {
+    /// The base pool state from the dependency
+    base: PoolState,
+    /// Decay fee flag (from padding)
+    decay_fee_flag: u8,
+    /// Initial decay fee rate in percentage (from padding)
+    decay_fee_init_fee_rate: u8,
+    /// Decrease rate for decay fee in percentage (from padding)
+    decay_fee_decrease_rate: u8,
+    /// Interval for decreasing decay fee in seconds (from padding)
+    decay_fee_decrease_interval: u8,
+}
+
+impl PoolStateExt {
+    /// Parse from account data including decay fee fields
+    fn try_deserialize(data: &[u8]) -> Result<Self> {
+        // First deserialize the base PoolState
+        let base = PoolState::try_deserialize(&mut &data[..])
+            .map_err(|e| anyhow!("Failed to deserialize PoolState: {}", e))?;
+        
+        // The decay fee fields are located after recent_epoch (at offset 1368)
+        // According to the contract:
+        // - recent_epoch is at offset 1360 (8 bytes)
+        // - decay_fee_flag is at offset 1368 (1 byte)
+        // - decay_fee_init_fee_rate is at offset 1369 (1 byte)
+        // - decay_fee_decrease_rate is at offset 1370 (1 byte)
+        // - decay_fee_decrease_interval is at offset 1371 (1 byte)
+        
+        // Calculate offsets based on PoolState structure
+        // PoolState size should be consistent with the contract
+        const DECAY_FEE_OFFSET: usize = 1368;
+        
+        let mut decay_fee_flag = 0u8;
+        let mut decay_fee_init_fee_rate = 0u8;
+        let mut decay_fee_decrease_rate = 0u8;
+        let mut decay_fee_decrease_interval = 0u8;
+        
+        if data.len() > DECAY_FEE_OFFSET + 3 {
+            decay_fee_flag = data[DECAY_FEE_OFFSET];
+            decay_fee_init_fee_rate = data[DECAY_FEE_OFFSET + 1];
+            decay_fee_decrease_rate = data[DECAY_FEE_OFFSET + 2];
+            decay_fee_decrease_interval = data[DECAY_FEE_OFFSET + 3];
+        }
+        
+        Ok(Self {
+            base,
+            decay_fee_flag,
+            decay_fee_init_fee_rate,
+            decay_fee_decrease_rate,
+            decay_fee_decrease_interval,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct ByrealClmmAmm {
     /// Pool account key
@@ -39,8 +96,8 @@ pub struct ByrealClmmAmm {
     label: String,
     /// Program ID
     program_id: Pubkey,
-    /// Pool state
-    pool_state: PoolState,
+    /// Pool state with decay fee fields
+    pool_state: PoolStateExt,
     /// AMM config
     amm_config: AmmConfig,
     /// Tick arrays cache
@@ -72,8 +129,8 @@ impl ByrealClmmAmm {
     /// Get all tick array addresses that might be needed for a swap
     fn get_all_tick_array_addresses(&self) -> Vec<Pubkey> {
         let mut addresses = Vec::new();
-        let tick_spacing = self.pool_state.tick_spacing as i32;
-        let current_tick = self.pool_state.tick_current;
+        let tick_spacing = self.pool_state.base.tick_spacing as i32;
+        let current_tick = self.pool_state.base.tick_current;
         
         // Get the current tick array
         let current_start_index = TickArrayState::get_array_start_index(current_tick, tick_spacing as u16);
@@ -86,6 +143,67 @@ impl ByrealClmmAmm {
         }
         
         addresses
+    }
+
+    /// Check if decay fee is enabled
+    fn is_decay_fee_enabled(&self) -> bool {
+        self.pool_state.decay_fee_flag & (1 << 0) != 0
+    }
+
+    /// Check if decay fee is enabled for selling mint0
+    fn is_decay_fee_on_sell_mint0(&self) -> bool {
+        self.pool_state.decay_fee_flag & (1 << 1) != 0
+    }
+
+    /// Check if decay fee is enabled for selling mint1
+    fn is_decay_fee_on_sell_mint1(&self) -> bool {
+        self.pool_state.decay_fee_flag & (1 << 2) != 0
+    }
+
+    /// Calculate decay fee rate based on current timestamp
+    /// Returns fee rate in hundredths of a bip (10^-6)
+    fn get_decay_fee_rate(&self, current_timestamp: u64) -> u32 {
+        if !self.is_decay_fee_enabled() {
+            return 0u32;
+        }
+
+        // Not open yet
+        if current_timestamp < self.pool_state.base.open_time {
+            return 0u32;
+        }
+
+        // Check for zero interval to avoid division by zero
+        if self.pool_state.decay_fee_decrease_interval == 0 {
+            return 0u32;
+        }
+
+        let interval_count = (current_timestamp - self.pool_state.base.open_time) / self.pool_state.decay_fee_decrease_interval as u64;
+        let decay_fee_decrease_rate = self.pool_state.decay_fee_decrease_rate as u64 * 10_000;
+
+        // 10^6 (FEE_RATE_DENOMINATOR_VALUE)
+        let hundredths_of_a_bip = 1_000_000u64;
+        let mut rate = hundredths_of_a_bip;
+
+        // Fast power calculation: (1 - x)^c
+        // x = decay_fee_decrease_rate / 10^6
+        // c = interval_count
+        {
+            let mut exp = interval_count;
+            let mut base = hundredths_of_a_bip.saturating_sub(decay_fee_decrease_rate);
+
+            while exp > 0 {
+                if exp % 2 == 1 {
+                    rate = rate.mul_div_ceil(base, hundredths_of_a_bip).unwrap();
+                }
+                base = base.mul_div_ceil(base, hundredths_of_a_bip).unwrap();
+                exp /= 2;
+            }
+        }
+
+        // Convert from percentage to hundredths of a bip
+        rate = rate.mul_div_ceil(self.pool_state.decay_fee_init_fee_rate as u64, 100u64).unwrap();
+
+        rate as u32
     }
 
     /// Compute swap for the given parameters
@@ -108,14 +226,30 @@ impl ByrealClmmAmm {
         let mut state = SwapState {
             amount_specified_remaining: amount_specified,
             amount_calculated: 0,
-            sqrt_price_x64: self.pool_state.sqrt_price_x64,
-            tick: self.pool_state.tick_current,
-            liquidity: self.pool_state.liquidity,
+            sqrt_price_x64: self.pool_state.base.sqrt_price_x64,
+            tick: self.pool_state.base.tick_current,
+            liquidity: self.pool_state.base.liquidity,
             fee_amount: 0,
         };
 
-        // Get fee rate from AMM config
-        let fee_rate = self.amm_config.trade_fee_rate;
+        // Calculate fee rate considering decay fee
+        let current_timestamp = self.clock_ref.unix_timestamp.load(std::sync::atomic::Ordering::Relaxed) as i64;
+        let mut fee_rate = self.amm_config.trade_fee_rate;
+        
+        if self.is_decay_fee_enabled() {
+            let mut decay_fee_rate = 0u32;
+            
+            if zero_for_one && self.is_decay_fee_on_sell_mint0() {
+                decay_fee_rate = self.get_decay_fee_rate(current_timestamp as u64);
+            } else if !zero_for_one && self.is_decay_fee_on_sell_mint1() {
+                decay_fee_rate = self.get_decay_fee_rate(current_timestamp as u64);
+            }
+            
+            // Use decay fee if it's higher than the base fee
+            if decay_fee_rate > fee_rate {
+                fee_rate = decay_fee_rate;
+            }
+        }
 
         // Simulate swap steps
         let mut tick_crossings = 0;
@@ -187,6 +321,7 @@ impl ByrealClmmAmm {
                 amount_specified - state.amount_specified_remaining 
             },
             fee_amount: state.fee_amount,
+            fee_rate,
             sqrt_price_x64: state.sqrt_price_x64,
             tick: state.tick,
         })
@@ -195,7 +330,7 @@ impl ByrealClmmAmm {
     /// Find next initialized tick in the swap direction
     fn find_next_initialized_tick(&self, current_tick: i32, zero_for_one: bool) -> Result<i32> {
         // This is a simplified version - in production you'd need to check tick arrays
-        let tick_spacing = self.pool_state.tick_spacing as i32;
+        let tick_spacing = self.pool_state.base.tick_spacing as i32;
         
         if zero_for_one {
             // Price decreasing, tick decreasing
@@ -209,8 +344,8 @@ impl ByrealClmmAmm {
     /// Get tick arrays needed for a swap in the given direction
     fn get_swap_tick_arrays(&self, zero_for_one: bool) -> Vec<Pubkey> {
         let mut addresses = Vec::new();
-        let tick_spacing = self.pool_state.tick_spacing as i32;
-        let current_tick = self.pool_state.tick_current;
+        let tick_spacing = self.pool_state.base.tick_spacing as i32;
+        let current_tick = self.pool_state.base.tick_current;
         
         // Get the current tick array
         let current_start_index = TickArrayState::get_array_start_index(current_tick, tick_spacing as u16);
@@ -232,7 +367,7 @@ impl ByrealClmmAmm {
 
 impl Amm for ByrealClmmAmm {
     fn from_keyed_account(keyed_account: &KeyedAccount, amm_context: &AmmContext) -> Result<Self> {
-        let pool_state = PoolState::try_deserialize(&mut keyed_account.account.data.as_slice())
+        let pool_state = PoolStateExt::try_deserialize(&keyed_account.account.data)
             .context("Failed to deserialize pool state")?;
         
         Ok(Self {
@@ -264,16 +399,16 @@ impl Amm for ByrealClmmAmm {
     }
 
     fn get_reserve_mints(&self) -> Vec<Pubkey> {
-        vec![self.pool_state.token_mint_0, self.pool_state.token_mint_1]
+        vec![self.pool_state.base.token_mint_0, self.pool_state.base.token_mint_1]
     }
 
     fn get_accounts_to_update(&self) -> Vec<Pubkey> {
         let mut accounts = vec![
             self.key, // Pool state itself
-            self.pool_state.token_vault_0,
-            self.pool_state.token_vault_1,
-            self.pool_state.amm_config,
-            self.pool_state.observation_key,
+            self.pool_state.base.token_vault_0,
+            self.pool_state.base.token_vault_1,
+            self.pool_state.base.amm_config,
+            self.pool_state.base.observation_key,
         ];
 
         // Add bitmap extension if exists
@@ -289,21 +424,21 @@ impl Amm for ByrealClmmAmm {
     fn update(&mut self, account_map: &AccountMap) -> Result<()> {
         // Update pool state
         if let Some(pool_data) = account_map.get(&self.key) {
-            self.pool_state = PoolState::try_deserialize(&mut pool_data.data.as_slice())?;
+            self.pool_state = PoolStateExt::try_deserialize(&pool_data.data)?;
         }
 
         // Update AMM config
-        if let Some(config_data) = account_map.get(&self.pool_state.amm_config) {
+        if let Some(config_data) = account_map.get(&self.pool_state.base.amm_config) {
             self.amm_config = AmmConfig::try_deserialize(&mut config_data.data.as_slice())?;
         }
 
         // Update vault balances
-        if let Some(vault_0_data) = account_map.get(&self.pool_state.token_vault_0) {
+        if let Some(vault_0_data) = account_map.get(&self.pool_state.base.token_vault_0) {
             let vault_0_account = anchor_spl::token::spl_token::state::Account::unpack(&vault_0_data.data)?;
             self.vault_a_amount = vault_0_account.amount;
         }
 
-        if let Some(vault_1_data) = account_map.get(&self.pool_state.token_vault_1) {
+        if let Some(vault_1_data) = account_map.get(&self.pool_state.base.token_vault_1) {
             let vault_1_account = anchor_spl::token::spl_token::state::Account::unpack(&vault_1_data.data)?;
             self.vault_b_amount = vault_1_account.amount;
         }
@@ -332,7 +467,7 @@ impl Amm for ByrealClmmAmm {
         }
 
         // Update observation state
-        if let Some(observation_data) = account_map.get(&self.pool_state.observation_key) {
+        if let Some(observation_data) = account_map.get(&self.pool_state.base.observation_key) {
             if let Ok(observation) = ObservationState::try_deserialize(&mut observation_data.data.as_slice()) {
                 self.observation_state = Some(observation);
             }
@@ -342,10 +477,10 @@ impl Amm for ByrealClmmAmm {
     }
 
     fn quote(&self, quote_params: &QuoteParams) -> Result<Quote> {
-        let zero_for_one = quote_params.input_mint == self.pool_state.token_mint_0;
+        let zero_for_one = quote_params.input_mint == self.pool_state.base.token_mint_0;
         
         // Verify input mint is valid
-        if !zero_for_one && quote_params.input_mint != self.pool_state.token_mint_1 {
+        if !zero_for_one && quote_params.input_mint != self.pool_state.base.token_mint_1 {
             return Err(anyhow!(
                 "Input mint {} does not match either mint in pool",
                 quote_params.input_mint
@@ -367,34 +502,34 @@ impl Amm for ByrealClmmAmm {
             out_amount: swap_result.amount_out,
             fee_amount: swap_result.fee_amount,
             fee_mint: quote_params.input_mint,
-            fee_pct: self.amm_config.trade_fee_rate.into(),
+            fee_pct: swap_result.fee_rate.into(),
         })
     }
 
     fn get_swap_and_account_metas(&self, swap_params: &SwapParams) -> Result<SwapAndAccountMetas> {
-        let zero_for_one = swap_params.source_mint == self.pool_state.token_mint_0;
+        let zero_for_one = swap_params.source_mint == self.pool_state.base.token_mint_0;
 
         // Build account metas for swap instruction
         let mut account_metas = vec![
             // Signer
             AccountMeta::new_readonly(swap_params.token_transfer_authority, true),
             // AMM Config
-            AccountMeta::new_readonly(self.pool_state.amm_config, false),
+            AccountMeta::new_readonly(self.pool_state.base.amm_config, false),
             // Pool state
             AccountMeta::new(self.key, false),
             // Input/Output vaults
             if zero_for_one {
-                AccountMeta::new(self.pool_state.token_vault_0, false)
+                AccountMeta::new(self.pool_state.base.token_vault_0, false)
             } else {
-                AccountMeta::new(self.pool_state.token_vault_1, false)
+                AccountMeta::new(self.pool_state.base.token_vault_1, false)
             },
             if zero_for_one {
-                AccountMeta::new(self.pool_state.token_vault_1, false)
+                AccountMeta::new(self.pool_state.base.token_vault_1, false)
             } else {
-                AccountMeta::new(self.pool_state.token_vault_0, false)
+                AccountMeta::new(self.pool_state.base.token_vault_0, false)
             },
             // Observation state
-            AccountMeta::new(self.pool_state.observation_key, false),
+            AccountMeta::new(self.pool_state.base.observation_key, false),
             // User token accounts
             AccountMeta::new(swap_params.source_token_account, false),
             AccountMeta::new(swap_params.destination_token_account, false),
@@ -451,6 +586,7 @@ struct SwapResult {
     amount_in: u64,
     amount_out: u64,
     fee_amount: u64,
+    fee_rate: u32,
     #[allow(dead_code)]
     sqrt_price_x64: u128,
     #[allow(dead_code)]
@@ -579,7 +715,7 @@ mod tests {
             key: pool_key,
             label: "Test".to_string(),
             program_id,
-            pool_state: PoolState::default(),
+            pool_state: PoolStateExt::default(),
             amm_config: AmmConfig::default(),
             tick_arrays: HashMap::new(),
             bitmap_extension: None,
@@ -604,9 +740,9 @@ mod tests {
         let pool_key = Pubkey::new_unique();
         let program_id = BYREAL_CLMM_PROGRAM;
         
-        let mut pool_state = PoolState::default();
-        pool_state.tick_current = 1000;
-        pool_state.tick_spacing = 10;
+        let mut pool_state = PoolStateExt::default();
+        pool_state.base.tick_current = 1000;
+        pool_state.base.tick_spacing = 10;
         
         let amm = ByrealClmmAmm {
             key: pool_key,
@@ -632,5 +768,127 @@ mod tests {
         
         // Verify they're different
         assert_ne!(arrays_down[1], arrays_up[1]);
+    }
+
+    #[test]
+    fn test_decay_fee_calculation() {
+        let pool_key = Pubkey::new_unique();
+        let program_id = BYREAL_CLMM_PROGRAM;
+        
+        let mut pool_state = PoolStateExt::default();
+        pool_state.base.tick_current = 1000;
+        pool_state.base.tick_spacing = 10;
+        pool_state.base.open_time = 0; // Pool opened at timestamp 0
+        pool_state.decay_fee_flag = 0b111; // Enable decay fee for both directions
+        pool_state.decay_fee_init_fee_rate = 80; // 80% initial fee
+        pool_state.decay_fee_decrease_rate = 10; // 10% decrease per interval
+        pool_state.decay_fee_decrease_interval = 10; // 10 seconds per interval
+        
+        let mut amm_config = AmmConfig::default();
+        amm_config.trade_fee_rate = 2500; // 0.25% base fee (2500 / 10^6)
+        
+        let amm = ByrealClmmAmm {
+            key: pool_key,
+            label: "Test".to_string(),
+            program_id,
+            pool_state,
+            amm_config,
+            tick_arrays: HashMap::new(),
+            bitmap_extension: None,
+            observation_state: None,
+            vault_a_amount: 0,
+            vault_b_amount: 0,
+            clock_ref: ClockRef::default(),
+        };
+        
+        // Test decay fee enabled
+        assert!(amm.is_decay_fee_enabled());
+        assert!(amm.is_decay_fee_on_sell_mint0());
+        assert!(amm.is_decay_fee_on_sell_mint1());
+        
+        // Test decay fee at different intervals
+        // Interval 0: timestamp 0-9, fee = 80%
+        let fee_rate = amm.get_decay_fee_rate(0);
+        assert_eq!(fee_rate, 800_000); // 80% = 800,000 / 10^6
+        
+        let fee_rate = amm.get_decay_fee_rate(9);
+        assert_eq!(fee_rate, 800_000); // Still 80%
+        
+        // Interval 1: timestamp 10-19, fee = 72%
+        let fee_rate = amm.get_decay_fee_rate(10);
+        assert_eq!(fee_rate, 720_000); // 72% = 720,000 / 10^6
+        
+        let fee_rate = amm.get_decay_fee_rate(19);
+        assert_eq!(fee_rate, 720_000); // Still 72%
+        
+        // Interval 2: timestamp 20-29, fee = 64.8%
+        let fee_rate = amm.get_decay_fee_rate(20);
+        assert_eq!(fee_rate, 648_000); // 64.8% = 648,000 / 10^6
+        
+        // Interval 3: timestamp 30-39, fee = 58.32%
+        let fee_rate = amm.get_decay_fee_rate(30);
+        assert_eq!(fee_rate, 583_200); // 58.32% = 583,200 / 10^6
+        
+        // Test after many intervals (should approach 0)
+        let fee_rate = amm.get_decay_fee_rate(1000);
+        assert!(fee_rate < 100); // Should be very small after 100 intervals
+    }
+
+    #[test]
+    fn test_decay_fee_disabled() {
+        let pool_key = Pubkey::new_unique();
+        let program_id = BYREAL_CLMM_PROGRAM;
+        
+        let mut pool_state = PoolStateExt::default();
+        pool_state.decay_fee_flag = 0; // Decay fee disabled
+        
+        let amm = ByrealClmmAmm {
+            key: pool_key,
+            label: "Test".to_string(),
+            program_id,
+            pool_state,
+            amm_config: AmmConfig::default(),
+            tick_arrays: HashMap::new(),
+            bitmap_extension: None,
+            observation_state: None,
+            vault_a_amount: 0,
+            vault_b_amount: 0,
+            clock_ref: ClockRef::default(),
+        };
+        
+        assert!(!amm.is_decay_fee_enabled());
+        assert_eq!(amm.get_decay_fee_rate(100), 0);
+    }
+
+    #[test]
+    fn test_decay_fee_before_open_time() {
+        let pool_key = Pubkey::new_unique();
+        let program_id = BYREAL_CLMM_PROGRAM;
+        
+        let mut pool_state = PoolStateExt::default();
+        pool_state.base.open_time = 1000; // Pool opens at timestamp 1000
+        pool_state.decay_fee_flag = 0b111; // Enable decay fee
+        pool_state.decay_fee_init_fee_rate = 50;
+        pool_state.decay_fee_decrease_interval = 10; // Set interval to avoid division by zero
+        
+        let amm = ByrealClmmAmm {
+            key: pool_key,
+            label: "Test".to_string(),
+            program_id,
+            pool_state,
+            amm_config: AmmConfig::default(),
+            tick_arrays: HashMap::new(),
+            bitmap_extension: None,
+            observation_state: None,
+            vault_a_amount: 0,
+            vault_b_amount: 0,
+            clock_ref: ClockRef::default(),
+        };
+        
+        // Before open time, fee should be 0
+        assert_eq!(amm.get_decay_fee_rate(999), 0);
+        
+        // At open time, fee should be initial rate
+        assert_eq!(amm.get_decay_fee_rate(1000), 500_000); // 50% = 500,000 / 10^6
     }
 }
