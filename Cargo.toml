@@ -17,7 +17,8 @@ solana-program = "2.3.0"
 jupiter-amm-interface = "0.5.1"
 
 # Raydium dependencies
-byreal-clmm = { git = "https://github.com/byreal-git/byreal-clmm.git", rev = "b47f5830fa6a25f9ee6afda03b732a322d7f7419" }
+byreal-clmm = { git = "https://github.com/byreal-git/byreal-clmm.git", branch = "feat/dynamic-tick-array" }
+bytemuck = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 solana-client = "2.3.0"

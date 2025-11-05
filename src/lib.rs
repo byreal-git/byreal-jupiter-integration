@@ -10,9 +10,11 @@ use jupiter_amm_interface::{
 };
 
 use byreal_clmm::{
-    states::{AmmConfig, PoolState, TickArrayState, TickArrayBitmapExtension, ObservationState},
+    states::{
+        AmmConfig, PoolState, TickArrayState, TickArrayBitmapExtension, ObservationState, TickUtils, DynTickArrayState, TickState,
+    },
     libraries::{
-        tick_math, swap_math,
+        tick_math, swap_math, liquidity_math,
         MAX_SQRT_PRICE_X64, MIN_SQRT_PRICE_X64
     },
 };
@@ -21,74 +23,28 @@ use byreal_clmm::states::{POOL_TICK_ARRAY_BITMAP_SEED, TICK_ARRAY_SEED};
 
 // Program IDs
 #[cfg(feature = "mainnet")]
-pub const BYREAL_CLMM_PROGRAM: Pubkey = solana_sdk::pubkey!("45iBNkaENereLKMjLm2LHkF3hpDapf6mnvrM5HWFg9cY");
+pub const BYREAL_CLMM_PROGRAM: Pubkey = solana_sdk::pubkey!("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2");
 
 #[cfg(feature = "devnet")]
 pub const BYREAL_CLMM_PROGRAM: Pubkey = solana_sdk::pubkey!("45iBNkaENereLKMjLm2LHkF3hpDapf6mnvrM5HWFg9cY");
 
 #[cfg(not(any(feature = "mainnet", feature = "devnet")))]
-pub const BYREAL_CLMM_PROGRAM: Pubkey = solana_sdk::pubkey!("45iBNkaENereLKMjLm2LHkF3hpDapf6mnvrM5HWFg9cY");
+pub const BYREAL_CLMM_PROGRAM: Pubkey = solana_sdk::pubkey!("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2");
 
 // Constants
 const TICK_ARRAY_SIZE: i32 = 60;
 const MAX_TICK_ARRAY_CROSSINGS: usize = 10;
 
-/// Extended pool state with decay fee fields parsed from padding
-#[derive(Clone, Default)]
-struct PoolStateExt {
-    /// The base pool state from the dependency
-    base: PoolState,
-    /// Decay fee flag (from padding)
-    decay_fee_flag: u8,
-    /// Initial decay fee rate in percentage (from padding)
-    decay_fee_init_fee_rate: u8,
-    /// Decrease rate for decay fee in percentage (from padding)
-    decay_fee_decrease_rate: u8,
-    /// Interval for decreasing decay fee in seconds (from padding)
-    decay_fee_decrease_interval: u8,
-}
-
-impl PoolStateExt {
-    /// Parse from account data including decay fee fields
-    fn try_deserialize(data: &[u8]) -> Result<Self> {
-        // First deserialize the base PoolState
-        let base = PoolState::try_deserialize(&mut &data[..])
-            .map_err(|e| anyhow!("Failed to deserialize PoolState: {}", e))?;
-
-        // Parse extended fields from base.padding1[0]
-        // padding1[0] packs the following bytes in little-endian order:
-        // [0]: decay_fee_flag (bit flags)
-        // [1]: decay_fee_init_fee_rate (percentage 0-100)
-        // [2]: decay_fee_decrease_rate (percentage 0-100, per interval)
-        // [3]: decay_fee_decrease_interval (seconds per interval)
-        // Extract packed value from padding1[0]
-        // Keep consistent with solana-dex-router/src/types/clmm.rs
-        let packed = base.padding1[0] as u64;
-        let decay_fee_flag = (packed & 0xFF) as u8;
-        let decay_fee_init_fee_rate = ((packed >> 8) & 0xFF) as u8;
-        let decay_fee_decrease_rate = ((packed >> 16) & 0xFF) as u8;
-        let decay_fee_decrease_interval = ((packed >> 24) & 0xFF) as u8;
-
-        Ok(Self {
-            base,
-            decay_fee_flag,
-            decay_fee_init_fee_rate,
-            decay_fee_decrease_rate,
-            decay_fee_decrease_interval,
-        })
-    }
-}
-
 #[derive(Clone)]
-pub struct ByrealClmmAmm {
+    pub struct ByrealClmmAmm {
     /// Pool account key
     key: Pubkey,
     /// Label for display
     label: String,
     /// Program ID
     program_id: Pubkey,
-    /// Pool state with decay fee fields
-    pool_state: PoolStateExt,
+    /// Pool state
+    pool_state: PoolState,
     /// AMM config
     amm_config: AmmConfig,
     /// Tick arrays cache
@@ -102,9 +58,183 @@ pub struct ByrealClmmAmm {
     vault_b_amount: u64,
     /// Clock reference
     clock_ref: ClockRef,
+    /// Raw tick array bytes cache (fixed or dynamic)
+    tick_arrays_raw: HashMap<Pubkey, Vec<u8>>,
 }
 
 impl ByrealClmmAmm {
+    /// Decode a dynamic tick array from raw bytes into header + tick slice views.
+    fn decode_dyn_tick_array<'a>(&self, data: &'a [u8]) -> Option<(&'a DynTickArrayState, &'a [TickState])> {
+        if data.len() < 8 { return None; }
+        if &data[0..8] != DynTickArrayState::DISCRIMINATOR { return None; }
+        if data.len() < DynTickArrayState::HEADER_LEN { return None; }
+
+        let header_bytes = &data[8..(DynTickArrayState::HEADER_LEN)];
+        let header: &DynTickArrayState = bytemuck::from_bytes(header_bytes);
+        let ticks_bytes = &data[DynTickArrayState::HEADER_LEN..];
+        // Safety: TickState derives AnyBitPattern in the CLMM crate
+        let ticks: &[TickState] = bytemuck::try_cast_slice(ticks_bytes).ok()?;
+        Some((header, ticks))
+    }
+
+    /// Decode a fixed tick array from raw bytes using Anchor deserialization.
+    fn decode_fixed_tick_array(&self, data: &[u8]) -> Option<TickArrayState> {
+        TickArrayState::try_deserialize(&mut data.to_vec().as_slice()).ok()
+    }
+
+    /// Extract the start_tick_index from either a fixed or dynamic tick array account data.
+    fn get_tick_array_start_index_from_bytes(&self, data: &[u8]) -> Option<i32> {
+        if data.len() >= 8 {
+            if &data[0..8] == DynTickArrayState::DISCRIMINATOR {
+                let (h, _) = self.decode_dyn_tick_array(data)?;
+                return Some(h.start_tick_index);
+            } else if &data[0..8] == TickArrayState::DISCRIMINATOR {
+                let ta = self.decode_fixed_tick_array(data)?;
+                return Some(ta.start_tick_index);
+            }
+        }
+        None
+    }
+
+    /// Find next initialized tick across tick arrays in the given direction.
+    /// This mirrors the on-chain navigation: search within the current array, otherwise
+    /// advance to the next initialized array and take its first initialized tick.
+    fn find_next_initialized_tick(&self, current_tick: i32, zero_for_one: bool) -> Result<i32> {
+        let spacing = self.pool_state.tick_spacing as u16;
+        let arrays = self.get_swap_tick_arrays(zero_for_one);
+        if arrays.is_empty() {
+            // fallback to arithmetic next grid if nothing available
+            let step = i32::from(spacing);
+            return Ok(if zero_for_one { ((current_tick / step) - 1) * step } else { ((current_tick / step) + 1) * step });
+        }
+
+        // Determine the array corresponding to current_tick
+        let current_start = TickUtils::get_array_start_index(current_tick, spacing);
+        let mut idx = 0usize;
+        let mut matched_current = false;
+        for (i, addr) in arrays.iter().enumerate() {
+            if let Some(bytes) = self.tick_arrays_raw.get(addr) {
+                if let Some(start) = self.get_tick_array_start_index_from_bytes(bytes) {
+                    if start == current_start { idx = i; matched_current = true; break; }
+                }
+            }
+        }
+
+        // Helper to fetch next initialized tick within an array
+        let search_in_array = |addr: &Pubkey, cur_tick: i32, allow_first: bool| -> Option<i32> {
+            let bytes = self.tick_arrays_raw.get(addr)?;
+            if bytes.len() < 8 { return None; }
+            if &bytes[0..8] == DynTickArrayState::DISCRIMINATOR {
+                let (header, _ticks) = self.decode_dyn_tick_array(bytes)?;
+                // Compute within-array search without mutating header
+                let start = header.start_tick_index;
+                let mut found_pos: Option<usize> = None;
+                if !allow_first {
+                    // search relative to current tick
+                    if TickUtils::get_array_start_index(cur_tick, spacing) == start {
+                        let mut offset_in_array = ((cur_tick - start) / (spacing as i32)) as i32;
+                        if zero_for_one {
+                            while offset_in_array >= 0 {
+                                if header.tick_offset_index[offset_in_array as usize] > 0 {
+                                    found_pos = Some(offset_in_array as usize); break;
+                                }
+                                offset_in_array -= 1;
+                            }
+                        } else {
+                            offset_in_array += 1;
+                            while offset_in_array < TICK_ARRAY_SIZE {
+                                if header.tick_offset_index[offset_in_array as usize] > 0 {
+                                    found_pos = Some(offset_in_array as usize); break;
+                                }
+                                offset_in_array += 1;
+                            }
+                        }
+                    }
+                }
+                if found_pos.is_none() && allow_first {
+                    if zero_for_one {
+                        let mut i = TICK_ARRAY_SIZE - 1;
+                        while i >= 0 {
+                            if header.tick_offset_index[i as usize] > 0 { found_pos = Some(i as usize); break; }
+                            i -= 1;
+                        }
+                    } else {
+                        let mut i: usize = 0;
+                        while i < TICK_ARRAY_SIZE as usize {
+                            if header.tick_offset_index[i] > 0 { found_pos = Some(i); break; }
+                            i += 1;
+                        }
+                    }
+                }
+                if let Some(off) = found_pos {
+                    return Some(start + (off as i32) * (spacing as i32));
+                }
+            } else if &bytes[0..8] == TickArrayState::DISCRIMINATOR {
+                if let Some(mut ta) = self.decode_fixed_tick_array(bytes) {
+                    if let Ok(Some(ts)) = ta.next_initialized_tick(cur_tick, spacing, zero_for_one) {
+                        return Some(ts.tick);
+                    }
+                    if allow_first {
+                        if let Ok(ts) = ta.first_initialized_tick(zero_for_one) {
+                            return Some(ts.tick);
+                        }
+                    }
+                }
+            }
+            None
+        };
+
+        // If current array matches, try within it using current_tick
+        if matched_current {
+            if let Some(t) = search_in_array(&arrays[idx], current_tick, false) {
+                return Ok(t);
+            }
+            // Otherwise advance in direction
+            let iter: Box<dyn Iterator<Item = &Pubkey>> = if zero_for_one {
+                Box::new(arrays[..idx].iter().rev())
+            } else {
+                Box::new(arrays[idx + 1..].iter())
+            };
+            for addr in iter {
+                if let Some(t) = search_in_array(addr, current_tick, true) { return Ok(t); }
+            }
+        } else {
+            // Not matched: start from the first array and take its first/next
+            let iter: Box<dyn Iterator<Item = &Pubkey>> = if zero_for_one { Box::new(arrays.iter().rev()) } else { Box::new(arrays.iter()) };
+            for addr in iter {
+                if let Some(t) = search_in_array(addr, current_tick, true) { return Ok(t); }
+            }
+        }
+
+        // Fallback grid if nothing found
+        let step = i32::from(spacing);
+        Ok(if zero_for_one { ((current_tick / step) - 1) * step } else { ((current_tick / step) + 1) * step })
+    }
+
+    /// Get liquidity_net for a given tick index from the cached tick arrays.
+    fn get_tick_liquidity_net(&self, tick_index: i32) -> Option<i128> {
+        let spacing = self.pool_state.tick_spacing as u16;
+        let start = TickUtils::get_array_start_index(tick_index, spacing);
+        let addr = self.get_tick_array_address(start);
+        let data = self.tick_arrays_raw.get(&addr)?;
+        if data.len() < 8 { return None; }
+        if &data[0..8] == DynTickArrayState::DISCRIMINATOR {
+            let (header, ticks) = self.decode_dyn_tick_array(data)?;
+            if let Ok(i) = header.get_tick_index_in_array(tick_index, spacing) {
+                return Some(ticks[i as usize].liquidity_net);
+            }
+            None
+        } else if &data[0..8] == TickArrayState::DISCRIMINATOR {
+            if let Some(ta) = self.decode_fixed_tick_array(data) {
+                if let Ok(offset) = ta.get_tick_offset_in_array(tick_index, spacing) {
+                    return Some(ta.ticks[offset].liquidity_net);
+                }
+            }
+            None
+        } else {
+            None
+        }
+    }
     /// Get the tick array PDA address
     fn get_tick_array_address(&self, start_index: i32) -> Pubkey {
         Pubkey::find_program_address(
@@ -117,23 +247,47 @@ impl ByrealClmmAmm {
         ).0
     }
 
-    /// Get all tick array addresses that might be needed for a swap
+    /// Get tick array addresses around current price using bitmap navigation (both directions).
+    /// Fallback to adjacent offsets if bitmap helpers are unavailable.
     fn get_all_tick_array_addresses(&self) -> Vec<Pubkey> {
-        let mut addresses = Vec::new();
-        let tick_spacing = self.pool_state.base.tick_spacing as i32;
-        let current_tick = self.pool_state.base.tick_current;
-        
-        // Get the current tick array
-        let current_start_index = TickArrayState::get_array_start_index(current_tick, tick_spacing as u16);
-        addresses.push(self.get_tick_array_address(current_start_index));
-        
-        // Add adjacent tick arrays (up to 12 on each side for ~24 total)
-        for i in 1..=12 {
-            addresses.push(self.get_tick_array_address(current_start_index - i * TICK_ARRAY_SIZE * tick_spacing));
-            addresses.push(self.get_tick_array_address(current_start_index + i * TICK_ARRAY_SIZE * tick_spacing));
+        use std::collections::BTreeSet;
+
+        let mut start_indexes: BTreeSet<i32> = BTreeSet::new();
+
+        let mut collect_dir = |zero_for_one: bool, limit: usize| {
+            if limit == 0 { return; }
+            if let Ok((_, mut start)) = self.pool_state.get_first_initialized_tick_array(&self.bitmap_extension, zero_for_one) {
+                start_indexes.insert(start);
+                for _ in 1..limit {
+                    match self.pool_state.next_initialized_tick_array_start_index(&self.bitmap_extension, start, zero_for_one) {
+                        Ok(Some(next)) => { start_indexes.insert(next); start = next; }
+                        _ => break,
+                    }
+                }
+            }
+        };
+
+        // Try bitmap-guided discovery (10 each direction)
+        collect_dir(true, 10);
+        collect_dir(false, 10);
+
+        // Fallback to naive neighbors if nothing collected
+        if start_indexes.is_empty() {
+            let tick_spacing = self.pool_state.tick_spacing as u16;
+            let current_tick = self.pool_state.tick_current;
+            let current_start_index = TickUtils::get_array_start_index(current_tick, tick_spacing);
+            start_indexes.insert(current_start_index);
+            for i in 1..=12 {
+                let offset = (TICK_ARRAY_SIZE * i as i32) * i32::from(tick_spacing);
+                start_indexes.insert(current_start_index.saturating_sub(offset));
+                start_indexes.insert(current_start_index.saturating_add(offset));
+            }
         }
-        
-        addresses
+
+        start_indexes
+            .into_iter()
+            .map(|s| self.get_tick_array_address(s))
+            .collect()
     }
 
     /// Check if decay fee is enabled
@@ -159,7 +313,7 @@ impl ByrealClmmAmm {
         }
 
         // Not open yet
-        if current_timestamp < self.pool_state.base.open_time {
+        if current_timestamp < self.pool_state.open_time {
             return 0u32;
         }
 
@@ -168,7 +322,7 @@ impl ByrealClmmAmm {
             return 0u32;
         }
 
-        let interval_count = (current_timestamp - self.pool_state.base.open_time) / self.pool_state.decay_fee_decrease_interval as u64;
+        let interval_count = (current_timestamp - self.pool_state.open_time) / self.pool_state.decay_fee_decrease_interval as u64;
         let decay_fee_decrease_rate = self.pool_state.decay_fee_decrease_rate as u64 * 10_000;
 
         // 10^6 (FEE_RATE_DENOMINATOR_VALUE)
@@ -217,9 +371,9 @@ impl ByrealClmmAmm {
         let mut state = SwapState {
             amount_specified_remaining: amount_specified,
             amount_calculated: 0,
-            sqrt_price_x64: self.pool_state.base.sqrt_price_x64,
-            tick: self.pool_state.base.tick_current,
-            liquidity: self.pool_state.base.liquidity,
+            sqrt_price_x64: self.pool_state.sqrt_price_x64,
+            tick: self.pool_state.tick_current,
+            liquidity: self.pool_state.liquidity,
             fee_amount: 0,
         };
 
@@ -290,8 +444,14 @@ impl ByrealClmmAmm {
                     .saturating_add(step.amount_in + step.fee_amount);
             }
 
-            // Update tick if we've crossed
+            // Update tick/liquidity if we've crossed an initialized tick boundary
             if state.sqrt_price_x64 == sqrt_price_next {
+                // Adjust liquidity on crossing initialized tick
+                if let Some(mut liq_net) = self.get_tick_liquidity_net(next_tick) {
+                    if zero_for_one { liq_net = -liq_net; }
+                    state.liquidity = liquidity_math::add_delta(state.liquidity, liq_net)
+                        .map_err(|e| anyhow!("Failed to adjust liquidity at tick {}: {:?}", next_tick, e))?;
+                }
                 state.tick = if zero_for_one { next_tick - 1 } else { next_tick };
                 tick_crossings += 1;
             } else {
@@ -316,47 +476,48 @@ impl ByrealClmmAmm {
         })
     }
 
-    /// Find next initialized tick in the swap direction
-    fn find_next_initialized_tick(&self, current_tick: i32, zero_for_one: bool) -> Result<i32> {
-        // This is a simplified version - in production you'd need to check tick arrays
-        let tick_spacing = self.pool_state.base.tick_spacing as i32;
-        
-        if zero_for_one {
-            // Price decreasing, tick decreasing
-            Ok(((current_tick / tick_spacing) - 1) * tick_spacing)
-        } else {
-            // Price increasing, tick increasing
-            Ok(((current_tick / tick_spacing) + 1) * tick_spacing)
-        }
-    }
+    // (removed: replaced by dynamic-aware implementation above)
     
-    /// Get tick arrays needed for a swap in the given direction
+    /// Get tick arrays needed for a swap, starting from the first initialized tick array
+    /// according to the direction, then following in that direction. Falls back to adjacent offsets.
     fn get_swap_tick_arrays(&self, zero_for_one: bool) -> Vec<Pubkey> {
-        let mut addresses = Vec::new();
-        let tick_spacing = self.pool_state.base.tick_spacing as i32;
-        let current_tick = self.pool_state.base.tick_current;
-        
-        // Get the current tick array
-        let current_start_index = TickArrayState::get_array_start_index(current_tick, tick_spacing as u16);
-        addresses.push(self.get_tick_array_address(current_start_index));
-        
-        // Add adjacent tick arrays in the swap direction (up to 10 arrays total)
-        for i in 1..=10 {
-            let offset = i * TICK_ARRAY_SIZE * tick_spacing;
-            if zero_for_one {
-                addresses.push(self.get_tick_array_address(current_start_index - offset));
-            } else {
-                addresses.push(self.get_tick_array_address(current_start_index + offset));
+        let mut addrs: Vec<Pubkey> = Vec::new();
+
+        // Preferred: bitmap-guided discovery from the first initialized tick array
+        if let Ok((_, first_start)) = self.pool_state.get_first_initialized_tick_array(&self.bitmap_extension, zero_for_one) {
+            addrs.push(self.get_tick_array_address(first_start));
+            let mut cur = first_start;
+            for _ in 1..=10 {
+                match self.pool_state.next_initialized_tick_array_start_index(&self.bitmap_extension, cur, zero_for_one) {
+                    Ok(Some(next)) => { addrs.push(self.get_tick_array_address(next)); cur = next; }
+                    _ => break,
+                }
             }
+            return addrs;
         }
-        
-        addresses
+
+        // Fallback: adjacent offsets from current array in the swap direction
+        let tick_spacing = self.pool_state.tick_spacing as u16;
+        let current_tick = self.pool_state.tick_current;
+        let current_start_index = TickUtils::get_array_start_index(current_tick, tick_spacing);
+        addrs.push(self.get_tick_array_address(current_start_index));
+        for i in 1..=10 {
+            let offset = (TICK_ARRAY_SIZE * i as i32) * i32::from(tick_spacing);
+            let s = if zero_for_one {
+                current_start_index.saturating_sub(offset)
+            } else {
+                current_start_index.saturating_add(offset)
+            };
+            addrs.push(self.get_tick_array_address(s));
+        }
+        addrs
     }
 }
 
 impl Amm for ByrealClmmAmm {
     fn from_keyed_account(keyed_account: &KeyedAccount, amm_context: &AmmContext) -> Result<Self> {
-        let pool_state = PoolStateExt::try_deserialize(&keyed_account.account.data)
+        let mut data_ref = keyed_account.account.data.as_slice();
+        let pool_state = PoolState::try_deserialize(&mut data_ref)
             .context("Failed to deserialize pool state")?;
         
         Ok(Self {
@@ -372,6 +533,7 @@ impl Amm for ByrealClmmAmm {
             vault_a_amount: 0,
             vault_b_amount: 0,
             clock_ref: amm_context.clock_ref.clone(),
+            tick_arrays_raw: HashMap::new(),
         })
     }
 
@@ -388,16 +550,16 @@ impl Amm for ByrealClmmAmm {
     }
 
     fn get_reserve_mints(&self) -> Vec<Pubkey> {
-        vec![self.pool_state.base.token_mint_0, self.pool_state.base.token_mint_1]
+        vec![self.pool_state.token_mint_0, self.pool_state.token_mint_1]
     }
 
     fn get_accounts_to_update(&self) -> Vec<Pubkey> {
         let mut accounts = vec![
             self.key, // Pool state itself
-            self.pool_state.base.token_vault_0,
-            self.pool_state.base.token_vault_1,
-            self.pool_state.base.amm_config,
-            self.pool_state.base.observation_key,
+            self.pool_state.token_vault_0,
+            self.pool_state.token_vault_1,
+            self.pool_state.amm_config,
+            self.pool_state.observation_key,
         ];
 
         // Add bitmap extension if exists
@@ -413,28 +575,31 @@ impl Amm for ByrealClmmAmm {
     fn update(&mut self, account_map: &AccountMap) -> Result<()> {
         // Update pool state
         if let Some(pool_data) = account_map.get(&self.key) {
-            self.pool_state = PoolStateExt::try_deserialize(&pool_data.data)?;
+            let mut buf = pool_data.data.as_slice();
+            self.pool_state = PoolState::try_deserialize(&mut buf)?;
         }
 
         // Update AMM config
-        if let Some(config_data) = account_map.get(&self.pool_state.base.amm_config) {
+        if let Some(config_data) = account_map.get(&self.pool_state.amm_config) {
             self.amm_config = AmmConfig::try_deserialize(&mut config_data.data.as_slice())?;
         }
 
         // Update vault balances
-        if let Some(vault_0_data) = account_map.get(&self.pool_state.base.token_vault_0) {
+        if let Some(vault_0_data) = account_map.get(&self.pool_state.token_vault_0) {
             let vault_0_account = anchor_spl::token::spl_token::state::Account::unpack(&vault_0_data.data)?;
             self.vault_a_amount = vault_0_account.amount;
         }
 
-        if let Some(vault_1_data) = account_map.get(&self.pool_state.base.token_vault_1) {
+        if let Some(vault_1_data) = account_map.get(&self.pool_state.token_vault_1) {
             let vault_1_account = anchor_spl::token::spl_token::state::Account::unpack(&vault_1_data.data)?;
             self.vault_b_amount = vault_1_account.amount;
         }
 
-        // Update tick arrays
+        // Update tick arrays (raw bytes + fixed decode if possible)
+        self.tick_arrays_raw.clear();
         for address in self.get_all_tick_array_addresses() {
             if let Some(tick_array_data) = account_map.get(&address) {
+                self.tick_arrays_raw.insert(address, tick_array_data.data.clone());
                 if let Ok(tick_array) = TickArrayState::try_deserialize(&mut tick_array_data.data.as_slice()) {
                     self.tick_arrays.insert(address, tick_array);
                 }
@@ -456,7 +621,7 @@ impl Amm for ByrealClmmAmm {
         }
 
         // Update observation state
-        if let Some(observation_data) = account_map.get(&self.pool_state.base.observation_key) {
+        if let Some(observation_data) = account_map.get(&self.pool_state.observation_key) {
             if let Ok(observation) = ObservationState::try_deserialize(&mut observation_data.data.as_slice()) {
                 self.observation_state = Some(observation);
             }
@@ -466,10 +631,10 @@ impl Amm for ByrealClmmAmm {
     }
 
     fn quote(&self, quote_params: &QuoteParams) -> Result<Quote> {
-        let zero_for_one = quote_params.input_mint == self.pool_state.base.token_mint_0;
+        let zero_for_one = quote_params.input_mint == self.pool_state.token_mint_0;
         
         // Verify input mint is valid
-        if !zero_for_one && quote_params.input_mint != self.pool_state.base.token_mint_1 {
+        if !zero_for_one && quote_params.input_mint != self.pool_state.token_mint_1 {
             return Err(anyhow!(
                 "Input mint {} does not match either mint in pool",
                 quote_params.input_mint
@@ -496,46 +661,59 @@ impl Amm for ByrealClmmAmm {
     }
 
     fn get_swap_and_account_metas(&self, swap_params: &SwapParams) -> Result<SwapAndAccountMetas> {
-        let zero_for_one = swap_params.source_mint == self.pool_state.base.token_mint_0;
+        let zero_for_one = swap_params.source_mint == self.pool_state.token_mint_0;
 
-        // Build account metas for swap instruction
+        // Build account metas for swap instruction (must match on-chain order)
         let mut account_metas = vec![
-            // Signer
+            // Signer (payer)
             AccountMeta::new_readonly(swap_params.token_transfer_authority, true),
             // AMM Config
-            AccountMeta::new_readonly(self.pool_state.base.amm_config, false),
+            AccountMeta::new_readonly(self.pool_state.amm_config, false),
             // Pool state
             AccountMeta::new(self.key, false),
-            // Input/Output vaults
-            if zero_for_one {
-                AccountMeta::new(self.pool_state.base.token_vault_0, false)
-            } else {
-                AccountMeta::new(self.pool_state.base.token_vault_1, false)
-            },
-            if zero_for_one {
-                AccountMeta::new(self.pool_state.base.token_vault_1, false)
-            } else {
-                AccountMeta::new(self.pool_state.base.token_vault_0, false)
-            },
-            // Observation state
-            AccountMeta::new(self.pool_state.base.observation_key, false),
-            // User token accounts
+            // User token accounts (input, output)
             AccountMeta::new(swap_params.source_token_account, false),
             AccountMeta::new(swap_params.destination_token_account, false),
+            // Vaults (input, output)
+            if zero_for_one {
+                AccountMeta::new(self.pool_state.token_vault_0, false)
+            } else {
+                AccountMeta::new(self.pool_state.token_vault_1, false)
+            },
+            if zero_for_one {
+                AccountMeta::new(self.pool_state.token_vault_1, false)
+            } else {
+                AccountMeta::new(self.pool_state.token_vault_0, false)
+            },
+            // Observation state
+            AccountMeta::new(self.pool_state.observation_key, false),
             // Token program
             AccountMeta::new_readonly(anchor_spl::token::ID, false),
         ];
 
-        // Add tick arrays needed for this specific swap
+        // Tick arrays for this swap: first is the named `tick_array`, others + bitmap extension go as remaining accounts
         let tick_arrays = self.get_swap_tick_arrays(zero_for_one);
-        for tick_array in tick_arrays {
-            account_metas.push(AccountMeta::new(tick_array, false));
+        if let Some((&first, rest)) = tick_arrays.split_first() {
+            // Named tick_array account
+            account_metas.push(AccountMeta::new(first, false));
+            // Bitmap extension (readonly) to support out-of-bound bitmaps
+            let bitmap_key = TickArrayBitmapExtension::key(self.key);
+            account_metas.push(AccountMeta::new_readonly(bitmap_key, false));
+            // Additional tick arrays as remaining accounts
+            for ta in rest {
+                account_metas.push(AccountMeta::new(*ta, false));
+            }
+        } else {
+            // Fallback: still include current tick array and bitmap extension
+            let tick_spacing = self.pool_state.tick_spacing as u16;
+            let current_start = TickUtils::get_array_start_index(self.pool_state.tick_current, tick_spacing);
+            account_metas.push(AccountMeta::new(self.get_tick_array_address(current_start), false));
+            let bitmap_key = TickArrayBitmapExtension::key(self.key);
+            account_metas.push(AccountMeta::new_readonly(bitmap_key, false));
         }
 
         Ok(SwapAndAccountMetas {
-            swap: Swap::RaydiumClmm {
-                // Can add custom params here if needed
-            },
+            swap: Swap::RaydiumClmm {},
             account_metas,
         })
     }
@@ -587,10 +765,10 @@ mod tests {
     #[test]
     fn test_jupiter_integration() {
         // Skip if not in integration test mode
-        // if std::env::var("RUN_INTEGRATION_TESTS").is_err() {
-        //     println!("Skipping integration test. Set RUN_INTEGRATION_TESTS=1 to run.");
-        //     return;
-        // }
+        if std::env::var("RUN_INTEGRATION_TESTS").is_err() {
+            println!("Skipping integration test. Set RUN_INTEGRATION_TESTS=1 to run.");
+            return;
+        }
 
         // Example pool addresses (replace with actual pools)
         // SOL-USDC pool on mainnet
@@ -700,7 +878,7 @@ mod tests {
             key: pool_key,
             label: "Test".to_string(),
             program_id,
-            pool_state: PoolStateExt::default(),
+            pool_state: PoolState::default(),
             amm_config: AmmConfig::default(),
             tick_arrays: HashMap::new(),
             bitmap_extension: None,
@@ -708,6 +886,7 @@ mod tests {
             vault_a_amount: 0,
             vault_b_amount: 0,
             clock_ref: ClockRef::default(),
+            tick_arrays_raw: HashMap::new(),
         };
         
         // Test tick array address generation
@@ -725,9 +904,9 @@ mod tests {
         let pool_key = Pubkey::new_unique();
         let program_id = BYREAL_CLMM_PROGRAM;
         
-        let mut pool_state = PoolStateExt::default();
-        pool_state.base.tick_current = 1000;
-        pool_state.base.tick_spacing = 10;
+        let mut pool_state = PoolState::default();
+        pool_state.tick_current = 1000;
+        pool_state.tick_spacing = 10;
         
         let amm = ByrealClmmAmm {
             key: pool_key,
@@ -741,6 +920,7 @@ mod tests {
             vault_a_amount: 0,
             vault_b_amount: 0,
             clock_ref: ClockRef::default(),
+            tick_arrays_raw: HashMap::new(),
         };
         
         // Test zero_for_one (price decreasing)
@@ -760,10 +940,10 @@ mod tests {
         let pool_key = Pubkey::new_unique();
         let program_id = BYREAL_CLMM_PROGRAM;
         
-        let mut pool_state = PoolStateExt::default();
-        pool_state.base.tick_current = 1000;
-        pool_state.base.tick_spacing = 10;
-        pool_state.base.open_time = 0; // Pool opened at timestamp 0
+        let mut pool_state = PoolState::default();
+        pool_state.tick_current = 1000;
+        pool_state.tick_spacing = 10;
+        pool_state.open_time = 0; // Pool opened at timestamp 0
         pool_state.decay_fee_flag = 0b111; // Enable decay fee for both directions
         pool_state.decay_fee_init_fee_rate = 80; // 80% initial fee
         pool_state.decay_fee_decrease_rate = 10; // 10% decrease per interval
@@ -784,6 +964,7 @@ mod tests {
             vault_a_amount: 0,
             vault_b_amount: 0,
             clock_ref: ClockRef::default(),
+            tick_arrays_raw: HashMap::new(),
         };
         
         // Test decay fee enabled
@@ -824,7 +1005,7 @@ mod tests {
         let pool_key = Pubkey::new_unique();
         let program_id = BYREAL_CLMM_PROGRAM;
         
-        let mut pool_state = PoolStateExt::default();
+        let mut pool_state = PoolState::default();
         pool_state.decay_fee_flag = 0; // Decay fee disabled
         
         let amm = ByrealClmmAmm {
@@ -839,6 +1020,7 @@ mod tests {
             vault_a_amount: 0,
             vault_b_amount: 0,
             clock_ref: ClockRef::default(),
+            tick_arrays_raw: HashMap::new(),
         };
         
         assert!(!amm.is_decay_fee_enabled());
@@ -850,8 +1032,8 @@ mod tests {
         let pool_key = Pubkey::new_unique();
         let program_id = BYREAL_CLMM_PROGRAM;
         
-        let mut pool_state = PoolStateExt::default();
-        pool_state.base.open_time = 1000; // Pool opens at timestamp 1000
+        let mut pool_state = PoolState::default();
+        pool_state.open_time = 1000; // Pool opens at timestamp 1000
         pool_state.decay_fee_flag = 0b111; // Enable decay fee
         pool_state.decay_fee_init_fee_rate = 50;
         pool_state.decay_fee_decrease_interval = 10; // Set interval to avoid division by zero
@@ -868,6 +1050,7 @@ mod tests {
             vault_a_amount: 0,
             vault_b_amount: 0,
             clock_ref: ClockRef::default(),
+            tick_arrays_raw: HashMap::new(),
         };
         
         // Before open time, fee should be 0
@@ -875,5 +1058,72 @@ mod tests {
         
         // At open time, fee should be initial rate
         assert_eq!(amm.get_decay_fee_rate(1000), 500_000); // 50% = 500,000 / 10^6
+    }
+
+    #[test]
+    fn test_decode_dyn_tick_array_and_next_tick() {
+        // Helper to build a minimal dynamic tick array bytes blob
+        fn build_dyn_bytes(start: i32, spacing: u16, offsets: &[usize]) -> Vec<u8> {
+            let mut header = DynTickArrayState::default();
+            header.start_tick_index = start;
+            header.alloc_tick_count = offsets.len() as u8;
+            // Map offsets to 1-based indices
+            for (i, off) in offsets.iter().enumerate() {
+                header.tick_offset_index[*off] = (i as u8) + 1;
+            }
+            let mut ticks: Vec<TickState> = Vec::with_capacity(offsets.len());
+            for off in offsets.iter() {
+                let mut t = TickState::default();
+                t.tick = start + (*off as i32) * (spacing as i32);
+                t.liquidity_gross = 1; // mark initialized
+                ticks.push(t);
+            }
+            let mut data = Vec::new();
+            data.extend_from_slice(&DynTickArrayState::DISCRIMINATOR);
+            data.extend_from_slice(bytemuck::bytes_of(&header));
+            data.extend_from_slice(bytemuck::cast_slice(&ticks));
+            data
+        }
+
+        let pool_key = Pubkey::new_unique();
+        let program_id = BYREAL_CLMM_PROGRAM;
+        let mut pool_state = PoolState::default();
+        pool_state.tick_spacing = 10;
+        pool_state.tick_current = 55; // current tick sits in the first array (start 0)
+
+        let mut amm = ByrealClmmAmm {
+            key: pool_key,
+            label: "Test".to_string(),
+            program_id,
+            pool_state,
+            amm_config: AmmConfig::default(),
+            tick_arrays: HashMap::new(),
+            bitmap_extension: None,
+            observation_state: None,
+            vault_a_amount: 0,
+            vault_b_amount: 0,
+            clock_ref: ClockRef::default(),
+            tick_arrays_raw: HashMap::new(),
+        };
+
+        // First array: start=0 has initialized ticks at offsets 3 (30) and 5 (50)
+        let start0 = TickUtils::get_array_start_index(55, 10);
+        let bytes0 = build_dyn_bytes(start0, 10, &[3, 5]);
+        let addr0 = amm.get_tick_array_address(start0);
+        amm.tick_arrays_raw.insert(addr0, bytes0);
+
+        // Second array: start=600 has ticks at 0 (600) and 2 (620)
+        let start1 = start0 + (TICK_ARRAY_SIZE as i32) * 10;
+        let bytes1 = build_dyn_bytes(start1, 10, &[0, 2]);
+        let addr1 = amm.get_tick_array_address(start1);
+        amm.tick_arrays_raw.insert(addr1, bytes1);
+
+        // zero_for_one=false (price increasing): next initialized >= current should be 600 in the next array
+        let next_up = amm.find_next_initialized_tick(amm.pool_state.tick_current, false).unwrap();
+        assert_eq!(next_up, start1);
+
+        // zero_for_one=true (price decreasing): next initialized <= current should be 50 in current array
+        let next_down = amm.find_next_initialized_tick(amm.pool_state.tick_current, true).unwrap();
+        assert_eq!(next_down, 50);
     }
 }
