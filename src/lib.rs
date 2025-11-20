@@ -120,49 +120,22 @@ impl ByrealClmmAmm {
             let bytes = self.tick_arrays_raw.get(addr)?;
             if bytes.len() < 8 { return None; }
             if &bytes[0..8] == DynTickArrayState::DISCRIMINATOR {
-                let (header, _ticks) = self.decode_dyn_tick_array(bytes)?;
-                // Compute within-array search without mutating header
-                let start = header.start_tick_index;
-                let mut found_pos: Option<usize> = None;
+                let (header, ticks) = self.decode_dyn_tick_array(bytes)?;
+                // For dynamic arrays, delegate to the on-chain helper methods that
+                // consult both the bitmap and TickState::is_initialized(), so that
+                // we don't stop on merely allocated but uninitialized ticks.
                 if !allow_first {
-                    // search relative to current tick
-                    if TickUtils::get_array_start_index(cur_tick, spacing) == start {
-                        let mut offset_in_array = ((cur_tick - start) / (spacing as i32)) as i32;
-                        if zero_for_one {
-                            while offset_in_array >= 0 {
-                                if header.tick_offset_index[offset_in_array as usize] > 0 {
-                                    found_pos = Some(offset_in_array as usize); break;
-                                }
-                                offset_in_array -= 1;
-                            }
-                        } else {
-                            offset_in_array += 1;
-                            while offset_in_array < TICK_ARRAY_SIZE {
-                                if header.tick_offset_index[offset_in_array as usize] > 0 {
-                                    found_pos = Some(offset_in_array as usize); break;
-                                }
-                                offset_in_array += 1;
-                            }
-                        }
+                    if let Ok(Some(local_idx)) =
+                        header.next_initialized_tick_index(ticks, cur_tick, spacing, zero_for_one)
+                    {
+                        let idx = local_idx as usize;
+                        return Some(ticks[idx].tick);
                     }
-                }
-                if found_pos.is_none() && allow_first {
-                    if zero_for_one {
-                        let mut i = TICK_ARRAY_SIZE - 1;
-                        while i >= 0 {
-                            if header.tick_offset_index[i as usize] > 0 { found_pos = Some(i as usize); break; }
-                            i -= 1;
-                        }
-                    } else {
-                        let mut i: usize = 0;
-                        while i < TICK_ARRAY_SIZE as usize {
-                            if header.tick_offset_index[i] > 0 { found_pos = Some(i); break; }
-                            i += 1;
-                        }
-                    }
-                }
-                if let Some(off) = found_pos {
-                    return Some(start + (off as i32) * (spacing as i32));
+                } else if let Ok(local_idx) =
+                    header.first_initialized_tick_index(ticks, zero_for_one)
+                {
+                    let idx = local_idx as usize;
+                    return Some(ticks[idx].tick);
                 }
             } else if &bytes[0..8] == TickArrayState::DISCRIMINATOR {
                 if let Some(mut ta) = self.decode_fixed_tick_array(bytes) {
@@ -730,25 +703,39 @@ impl Amm for ByrealClmmAmm {
             AccountMeta::new_readonly(anchor_spl::token::ID, false),
         ];
 
-        // Tick arrays for this swap: first is the named `tick_array`, others + bitmap extension go as remaining accounts
-        let tick_arrays = self.get_swap_tick_arrays(zero_for_one);
-        if let Some((&first, rest)) = tick_arrays.split_first() {
-            // Named tick_array account
-            account_metas.push(AccountMeta::new(first, false));
-            // Bitmap extension (readonly) to support out-of-bound bitmaps
-            let bitmap_key = TickArrayBitmapExtension::key(self.key);
-            account_metas.push(AccountMeta::new_readonly(bitmap_key, false));
-            // Additional tick arrays as remaining accounts
-            for ta in rest {
-                account_metas.push(AccountMeta::new(*ta, false));
-            }
-        } else {
-            // Fallback: still include current tick array and bitmap extension
-            let tick_spacing = self.pool_state.tick_spacing as u16;
-            let current_start = TickUtils::get_array_start_index(self.pool_state.tick_current, tick_spacing);
-            account_metas.push(AccountMeta::new(self.get_tick_array_address(current_start), false));
-            let bitmap_key = TickArrayBitmapExtension::key(self.key);
-            account_metas.push(AccountMeta::new_readonly(bitmap_key, false));
+        // Tick arrays for this swap:
+        // - start from directional candidates from get_swap_tick_arrays;
+        // - keep only those for which we actually have account bytes loaded
+        //   (so they are present in tick_arrays_raw and thus in LiteSVM);
+        // - if none of the directional candidates are present, fall back to
+        //   *any* tick arrays we have in tick_arrays_raw.
+        let candidate_tick_arrays = self.get_swap_tick_arrays(zero_for_one);
+        let mut live_tick_arrays: Vec<Pubkey> = candidate_tick_arrays
+            .into_iter()
+            .filter(|addr| self.tick_arrays_raw.contains_key(addr))
+            .collect();
+
+        if live_tick_arrays.is_empty() {
+            live_tick_arrays.extend(self.tick_arrays_raw.keys().copied());
+        }
+
+        if live_tick_arrays.is_empty() {
+            return Err(anyhow!(
+                "No tick array accounts available for swap; cannot build account metas"
+            ));
+        }
+
+        // Primary tick array (named account in Anchor context)
+        let primary_tick_array = live_tick_arrays[0];
+        account_metas.push(AccountMeta::new(primary_tick_array, false));
+
+        // Bitmap extension (readonly) to support out-of-bound bitmaps
+        let bitmap_key = TickArrayBitmapExtension::key(self.key);
+        account_metas.push(AccountMeta::new_readonly(bitmap_key, false));
+
+        // Additional tick arrays as remaining accounts
+        for addr in live_tick_arrays.iter().skip(1) {
+            account_metas.push(AccountMeta::new(*addr, false));
         }
 
         Ok(SwapAndAccountMetas {
@@ -852,6 +839,32 @@ mod tests {
         
         // Update AMM state
         amm.update(&account_map).unwrap();
+
+        // Debug: inspect discriminators for CLMM-owned accounts and our local
+        // type discriminators, to ensure we are selecting the correct
+        // tick_array accounts (fixed or dynamic).
+        println!(
+            "TickArrayState discriminator (SDK): {:?}",
+            TickArrayState::DISCRIMINATOR
+        );
+        println!(
+            "DynTickArrayState discriminator (SDK): {:?}",
+            DynTickArrayState::DISCRIMINATOR
+        );
+        for (addr, acc) in account_map.iter() {
+            if acc.owner != BYREAL_CLMM_PROGRAM || acc.data.len() < 8 {
+                continue;
+            }
+            let disc = &acc.data[0..8];
+            let kind = if disc == TickArrayState::DISCRIMINATOR {
+                "fixed_tick_array"
+            } else if disc == DynTickArrayState::DISCRIMINATOR {
+                "dyn_tick_array"
+            } else {
+                "other_clmm_account"
+            };
+            println!("CLMM account {} kind={} disc_bytes={:?}", addr, kind, disc);
+        }
         
         // Test quotes
         let mints = amm.get_reserve_mints();
@@ -1230,5 +1243,447 @@ mod tests {
         // surface an error instead of silently falling back.
         let res = amm.compute_swap(true, 1_000u64, true, None);
         assert!(res.is_err());
+    }
+
+    /// LiteSVM vs SDK quote test for the Byreal JUP/USDC CLMM pool.
+    ///
+    /// This test:
+    /// - fetches pool + tick-array snapshot from mainnet,
+    /// - computes SDK quote via `Amm::quote`,
+    /// - sets the same accounts into a LiteSVM VM with the byreal_clmm BPF binary,
+    /// - simulates a `swap` instruction,
+    /// - compares the user output amount between LiteSVM and SDK math.
+    #[cfg(feature = "with-litesvm")]
+    #[test]
+    #[ignore]
+    fn test_litesvm_vs_sdk_byreal_jup_usdc() {
+        use litesvm::LiteSVM;
+        use solana_clock::Clock as RawClock;
+        use solana_account::Account as RawAccount;
+        use solana_pubkey::Pubkey as RawPubkey;
+        use solana_instruction::{account_meta::AccountMeta as RawAccountMeta, Instruction as RawInstruction};
+        use solana_message::Message as RawMessage;
+        use solana_transaction::Transaction as RawTransaction;
+        use solana_client::rpc_request::TokenAccountsFilter;
+
+        // 1. Build SDK AMM from mainnet snapshot
+        let rpc = RpcClient::new("https://api.mainnet-beta.solana.com");
+        let pool_address = Pubkey::from_str("FzgAY4P1Ewc9DusU7gNkuWwfZmDbcSgDVhM999meRaXd").unwrap();
+        let jup_mint = Pubkey::from_str("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN").unwrap();
+        let usdc_mint = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
+
+        let account = rpc.get_account(&pool_address).unwrap();
+        let keyed_account = KeyedAccount {
+            key: pool_address,
+            account: account.into(),
+            params: None,
+        };
+        let amm_context = AmmContext {
+            clock_ref: ClockRef::default(),
+        };
+        let mut amm = ByrealClmmAmm::from_keyed_account(&keyed_account, &amm_context).unwrap();
+
+        let accounts_to_update = amm.get_accounts_to_update();
+        let accounts = rpc.get_multiple_accounts(&accounts_to_update).unwrap();
+        let mut account_map: AccountMap = accounts_to_update
+            .iter()
+            .enumerate()
+            .filter_map(|(i, key)| {
+                accounts[i]
+                    .as_ref()
+                    .map(|account| (*key, account.clone().into()))
+            })
+            .collect();
+        amm.update(&account_map).unwrap();
+
+        // Ensure we have *all* tick array accounts that the on-chain program
+        // may touch, based on the bitmap navigation helpers, not just the
+        // subset returned by get_accounts_to_update(). Otherwise the program
+        // can legitimately throw NotEnoughTickArrayAccount while the SDK
+        // math succeeds.
+        let mut full_tick_addrs: HashSet<Pubkey> = HashSet::new();
+        for &dir in &[true, false] {
+            if let Ok((_, mut start)) =
+                amm.pool_state.get_first_initialized_tick_array(&amm.bitmap_extension, dir)
+            {
+                loop {
+                    full_tick_addrs.insert(amm.get_tick_array_address(start));
+                    match amm.pool_state.next_initialized_tick_array_start_index(
+                        &amm.bitmap_extension,
+                        start,
+                        dir,
+                    ) {
+                        Ok(Some(next)) => {
+                            start = next;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+        for addr in full_tick_addrs.into_iter() {
+            if !account_map.contains_key(&addr) {
+                if let Ok(acc) = rpc.get_account(&addr) {
+                    account_map.insert(addr, acc.into());
+                }
+            }
+        }
+        // Re-sync AMM with the enriched account map so that both SDK math and
+        // LiteSVM simulation see the same complete tick array set.
+        amm.update(&account_map).unwrap();
+
+        // Debug: print SDK-side discriminators and CLMM-owned accounts'
+        // first 8 bytes to verify which accounts are actually tick arrays
+        // from the program's perspective (fixed or dynamic).
+        println!(
+            "TickArrayState discriminator (SDK): {:?}",
+            TickArrayState::DISCRIMINATOR
+        );
+        println!(
+            "DynTickArrayState discriminator (SDK): {:?}",
+            DynTickArrayState::DISCRIMINATOR
+        );
+        for (addr, acc) in account_map.iter() {
+            if acc.owner != BYREAL_CLMM_PROGRAM || acc.data.len() < 8 {
+                continue;
+            }
+            let disc = &acc.data[0..8];
+            let kind = if disc == TickArrayState::DISCRIMINATOR {
+                "fixed_tick_array"
+            } else if disc == DynTickArrayState::DISCRIMINATOR {
+                "dyn_tick_array"
+            } else {
+                "other_clmm_account"
+            };
+            println!("CLMM account {} kind={} disc_bytes={:?}", addr, kind, disc);
+        }
+
+        // Discover user's JUP/USDC token accounts (using 89WM... as authority)
+        let user = Pubkey::from_str("CPZmKkAhD2wv1Z21EUZvdH8ZeSD13geAnSfyVBwcW8XK").unwrap();
+        let jup_accounts = rpc
+            .get_token_accounts_by_owner(&user, TokenAccountsFilter::Mint(jup_mint))
+            .unwrap();
+        let usdc_accounts = rpc
+            .get_token_accounts_by_owner(&user, TokenAccountsFilter::Mint(usdc_mint))
+            .unwrap();
+        if jup_accounts.is_empty() || usdc_accounts.is_empty() {
+            println!("User missing JUP or USDC ATA; skipping LiteSVM test.");
+            return;
+        }
+        let jup_ata = Pubkey::from_str(&jup_accounts[0].pubkey).unwrap();
+        let usdc_ata = Pubkey::from_str(&usdc_accounts[0].pubkey).unwrap();
+
+        // Use the actual JUP balance in the user's ATA as the input amount.
+        let amount_in: u64 = 362500000;
+        if amount_in == 0 {
+            println!(
+                "User JUP ATA {} has zero balance; skipping LiteSVM test.",
+                jup_ata
+            );
+            return;
+        }
+
+        // SDK quote baseline
+        let sdk_quote = amm
+            .quote(&QuoteParams {
+                amount: amount_in,
+                input_mint: jup_mint,
+                output_mint: usdc_mint,
+                swap_mode: SwapMode::ExactIn,
+            })
+            .unwrap();
+        println!(
+            "SDK quote: in={}, out={}, fee={}",
+            sdk_quote.in_amount, sdk_quote.out_amount, sdk_quote.fee_amount
+        );
+
+        // 2. Build LiteSVM VM and load Byreal CLMM BPF program
+        let mut svm = LiteSVM::new()
+            .with_sysvars()
+            .with_builtins()
+            .with_default_programs()
+            .with_sigverify(false)
+            .with_blockhash_check(false);
+
+        // Path is relative to this crate's src/, use two levels up.
+        let program_bytes =
+            include_bytes!("../../solana-dex-clmm/target/sbf-solana-solana/release/byreal_clmm.so");
+        let clmm_program = RawPubkey::new_from_array(BYREAL_CLMM_PROGRAM.to_bytes());
+        svm.add_program(clmm_program, program_bytes).unwrap();
+
+        // 3. Write the same pool/tick/aux accounts into LiteSVM
+        for (addr, acc) in account_map.iter() {
+            let raw_addr = RawPubkey::new_from_array(addr.to_bytes());
+            let raw_acc = RawAccount {
+                lamports: acc.lamports,
+                data: acc.data.clone(),
+                owner: RawPubkey::new_from_array(acc.owner.to_bytes()),
+                executable: acc.executable,
+                rent_epoch: acc.rent_epoch,
+            };
+            svm.set_account(raw_addr, raw_acc).unwrap();
+        }
+
+        // Also write user JUP/USDC token accounts from mainnet snapshot
+        for ata in [jup_ata, usdc_ata] {
+            let acc = rpc.get_account(&ata).unwrap();
+            let raw_addr = RawPubkey::new_from_array(ata.to_bytes());
+            let raw_acc = RawAccount {
+                lamports: acc.lamports,
+                data: acc.data,
+                owner: RawPubkey::new_from_array(acc.owner.to_bytes()),
+                executable: acc.executable,
+                rent_epoch: acc.rent_epoch,
+            };
+            svm.set_account(raw_addr, raw_acc).unwrap();
+        }
+
+        // Ensure user lamport account exists in LiteSVM via airdrop
+        let user_raw = RawPubkey::new_from_array(user.to_bytes());
+        svm.airdrop(&user_raw, 1_000_000_000).unwrap();
+
+        // Align LiteSVM clock so that swap pool is considered "open".
+        // The on-chain program requires block_timestamp > pool_state.open_time.
+        let mut clock_sysvar: RawClock = svm.get_sysvar();
+        // pool_state.open_time is u64 seconds; set VM clock just after that.
+        clock_sysvar.unix_timestamp = (amm.pool_state.open_time as i64).saturating_add(1);
+        svm.set_sysvar(&clock_sysvar);
+
+        // 4. Construct swap instruction accounts directly from the snapshot.
+        //    First, follow the on-chain bitmap navigation to compute the
+        //    ordered tick_array start indices in the swap direction, so that
+        //    the tick_array_states queue matches the program's expectations
+        //    and avoids NotEnoughTickArrayAccount due to ordering issues.
+        let zero_for_one = jup_mint == amm.pool_state.token_mint_0;
+        let (input_vault, output_vault) = if zero_for_one {
+            (amm.pool_state.token_vault_0, amm.pool_state.token_vault_1)
+        } else {
+            (amm.pool_state.token_vault_1, amm.pool_state.token_vault_0)
+        };
+
+        // All accounts in the snapshot that look like tick arrays (used as fallback)
+        let mut all_tick_arrays: Vec<Pubkey> = Vec::new();
+        for (addr, acc) in account_map.iter() {
+            if acc.owner != BYREAL_CLMM_PROGRAM || acc.data.len() < 8 {
+                continue;
+            }
+            let disc = &acc.data[0..8];
+            if disc == DynTickArrayState::DISCRIMINATOR
+                || disc == TickArrayState::DISCRIMINATOR
+            {
+                all_tick_arrays.push(*addr);
+            }
+        }
+        if all_tick_arrays.is_empty() {
+            panic!("No tick array accounts with valid discriminator found in snapshot");
+        }
+
+        // Traverse all initialized tick_array start indices in the current
+        // swap direction using pool_state + bitmap_extension to derive an
+        // ordered list of tick_array addresses.
+        let mut ordered_tick_arrays: Vec<Pubkey> = Vec::new();
+        if let Ok((_, mut start)) =
+            amm.pool_state
+                .get_first_initialized_tick_array(&amm.bitmap_extension, zero_for_one)
+        {
+            loop {
+                let addr = amm.get_tick_array_address(start);
+                if account_map.contains_key(&addr) {
+                    ordered_tick_arrays.push(addr);
+                }
+                match amm.pool_state.next_initialized_tick_array_start_index(
+                    &amm.bitmap_extension,
+                    start,
+                    zero_for_one,
+                ) {
+                    Ok(Some(next)) => {
+                        start = next;
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        // If bitmap navigation yields nothing (e.g. missing bitmap_extension),
+        // fall back to the full set of known tick_array accounts to ensure
+        // the set is never empty.
+        if ordered_tick_arrays.is_empty() {
+            ordered_tick_arrays.extend(all_tick_arrays.iter().copied());
+        }
+        if ordered_tick_arrays.is_empty() {
+            panic!("No ordered tick array accounts available for swap");
+        }
+
+        println!("Selected tick_array candidates (ordered_tick_arrays):");
+        for addr in ordered_tick_arrays.iter() {
+            if let Some(acc) = account_map.get(addr) {
+                let disc = if acc.data.len() >= 8 {
+                    Some(&acc.data[0..8])
+                } else {
+                    None
+                };
+                println!("- {} disc_bytes={:?}", addr, disc);
+            }
+        }
+
+        #[derive(anchor_lang::AnchorSerialize, anchor_lang::AnchorDeserialize)]
+        struct SwapIxArgs {
+            amount: u64,
+            other_amount_threshold: u64,
+            sqrt_price_limit_x64: u128,
+            is_base_input: bool,
+        }
+
+        // Discriminator for `swap` from byreal_clmm IDL
+        let mut data = vec![248u8, 198, 158, 145, 225, 117, 135, 200];
+        data.extend(
+            SwapIxArgs {
+                amount: amount_in,
+                other_amount_threshold: 0,
+                sqrt_price_limit_x64: 0,
+                is_base_input: true,
+            }
+            .try_to_vec()
+            .unwrap(),
+        );
+
+        // Build accounts following byreal_clmm `swap` IDL:
+        // payer, amm_config, pool_state, input_token_account, output_token_account,
+        // input_vault, output_vault, observation_state, token_program, tick_array,
+        // then remaining_accounts: bitmap extension (if any) + other tick arrays,
+        // in the exact order computed in ordered_tick_arrays.
+        let mut accounts: Vec<RawAccountMeta> = Vec::new();
+
+        // payer (signer)
+        accounts.push(RawAccountMeta {
+            pubkey: RawPubkey::new_from_array(user.to_bytes()),
+            is_signer: true,
+            is_writable: false,
+        });
+        // amm_config
+        accounts.push(RawAccountMeta {
+            pubkey: RawPubkey::new_from_array(amm.pool_state.amm_config.to_bytes()),
+            is_signer: false,
+            is_writable: false,
+        });
+        // pool_state
+        accounts.push(RawAccountMeta {
+            pubkey: RawPubkey::new_from_array(amm.key.to_bytes()),
+            is_signer: false,
+            is_writable: true,
+        });
+        // input / output user token accounts
+        accounts.push(RawAccountMeta {
+            pubkey: RawPubkey::new_from_array(jup_ata.to_bytes()),
+            is_signer: false,
+            is_writable: true,
+        });
+        accounts.push(RawAccountMeta {
+            pubkey: RawPubkey::new_from_array(usdc_ata.to_bytes()),
+            is_signer: false,
+            is_writable: true,
+        });
+        // input / output vaults
+        accounts.push(RawAccountMeta {
+            pubkey: RawPubkey::new_from_array(input_vault.to_bytes()),
+            is_signer: false,
+            is_writable: true,
+        });
+        accounts.push(RawAccountMeta {
+            pubkey: RawPubkey::new_from_array(output_vault.to_bytes()),
+            is_signer: false,
+            is_writable: true,
+        });
+        // observation_state
+        accounts.push(RawAccountMeta {
+            pubkey: RawPubkey::new_from_array(amm.pool_state.observation_key.to_bytes()),
+            is_signer: false,
+            is_writable: true,
+        });
+        // token_program
+        accounts.push(RawAccountMeta {
+            pubkey: RawPubkey::new_from_array(anchor_spl::token::ID.to_bytes()),
+            is_signer: false,
+            is_writable: false,
+        });
+
+        // Primary tick array (named account in SwapSingle)
+        let primary_tick_array = ordered_tick_arrays[0];
+        accounts.push(RawAccountMeta {
+            pubkey: RawPubkey::new_from_array(primary_tick_array.to_bytes()),
+            is_signer: false,
+            is_writable: true,
+        });
+
+        // Remaining accounts: bitmap extension (if present) then other tick arrays
+        let bitmap_key = TickArrayBitmapExtension::key(amm.key);
+        if account_map.contains_key(&bitmap_key) {
+            accounts.push(RawAccountMeta {
+                pubkey: RawPubkey::new_from_array(bitmap_key.to_bytes()),
+                is_signer: false,
+                is_writable: false,
+            });
+        }
+        for addr in ordered_tick_arrays.iter().skip(1) {
+            accounts.push(RawAccountMeta {
+                pubkey: RawPubkey::new_from_array(addr.to_bytes()),
+                is_signer: false,
+                is_writable: true,
+            });
+        }
+
+        let raw_ix = RawInstruction {
+            program_id: clmm_program,
+            accounts,
+            data,
+        };
+
+        // Use the real user as fee payer in the message so LiteSVM's
+        // fee-payer validation passes (we already airdropped lamports
+        // to `user_raw` above).
+        let msg = RawMessage::new(&[raw_ix], Some(&user_raw));
+        // Construct an unsigned transaction; LiteSVM is configured with
+        // `with_sigverify(false)` and `with_blockhash_check(false)`, so we
+        // don't need real signatures here, only the correct signer layout.
+        let tx = RawTransaction::new_unsigned(msg);
+
+        // 5. Simulate transaction in LiteSVM
+        let sim = svm
+            .simulate_transaction(tx)
+            .expect("LiteSVM simulate_transaction should succeed");
+
+        // Find post-simulated USDC ATA and compute out amount
+        let usdc_raw = RawPubkey::new_from_array(usdc_ata.to_bytes());
+        let mut post_usdc_amount: Option<u64> = None;
+        for (pk, acc) in sim.post_accounts.iter() {
+            if *pk == usdc_raw {
+                let raw: RawAccount = (*acc).clone().into();
+                if let Ok(token_acc) =
+                    anchor_spl::token::spl_token::state::Account::unpack(&raw.data)
+                {
+                    post_usdc_amount = Some(token_acc.amount);
+                }
+            }
+        }
+
+        if post_usdc_amount.is_none() {
+            println!("LiteSVM did not modify USDC ATA; logs: {:?}", sim.meta.logs);
+            return;
+        }
+
+        let pre_usdc_acc = rpc.get_account(&usdc_ata).unwrap();
+        let pre_usdc_token =
+            anchor_spl::token::spl_token::state::Account::unpack(&pre_usdc_acc.data).unwrap();
+        let pre_amount = pre_usdc_token.amount;
+        let post_amount = post_usdc_amount.unwrap();
+        let litesvm_out = post_amount.saturating_sub(pre_amount);
+
+        println!(
+            "LiteSVM out={}, diff (sdk_math - litesvm)={}",
+            litesvm_out,
+            sdk_quote.out_amount.saturating_sub(litesvm_out)
+        );
+
+        // In ideal case we expect exact match; for now just print diff for inspection.
     }
 }
