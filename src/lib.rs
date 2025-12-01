@@ -910,6 +910,75 @@ mod tests {
     use solana_client::rpc_client::RpcClient;
     use std::str::FromStr;
 
+    /// Load a snapshot of Solana accounts from a directory where each
+    /// file is named `<pubkey>.bin` and contains a serialized
+    /// `solana_sdk::account::Account` in the layout:
+    /// lamports: u64, data_len: u64, data: [u8; data_len],
+    /// owner: Pubkey(32), executable: bool, rent_epoch: u64.
+    fn load_snapshot_account_map(dir: &str) -> AccountMap {
+        use std::{fs, path::Path};
+
+        fn decode_account_from_bytes(mut bytes: &[u8]) -> solana_sdk::account::Account {
+            use std::convert::TryInto;
+
+            fn read_u64(cur: &mut &[u8]) -> u64 {
+                let (head, rest) = cur.split_at(8);
+                *cur = rest;
+                u64::from_le_bytes(head.try_into().unwrap())
+            }
+
+            let lamports = read_u64(&mut bytes);
+            let data_len = read_u64(&mut bytes) as usize;
+            let (data_bytes, rest) = bytes.split_at(data_len);
+            bytes = rest;
+
+            let mut owner_bytes = [0u8; 32];
+            owner_bytes.copy_from_slice(&bytes[..32]);
+            bytes = &bytes[32..];
+
+            let executable = bytes[0] != 0;
+            bytes = &bytes[1..];
+
+            let rent_epoch = read_u64(&mut bytes);
+
+            solana_sdk::account::Account {
+                lamports,
+                data: data_bytes.to_vec(),
+                owner: Pubkey::new_from_array(owner_bytes),
+                executable,
+                rent_epoch,
+            }
+        }
+
+        let path = Path::new(dir);
+        if !path.exists() {
+            panic!("Snapshot directory {} does not exist", dir);
+        }
+
+        let mut map: AccountMap = AccountMap::default();
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let file_path = entry.path();
+            if !file_path.is_file() {
+                continue;
+            }
+            if file_path.extension().and_then(|s| s.to_str()) != Some("bin") {
+                continue;
+            }
+            let file_stem = file_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("snapshot filename must be valid utf-8");
+            let pubkey = Pubkey::from_str(file_stem)
+                .unwrap_or_else(|_| panic!("Invalid pubkey filename in snapshot: {}", file_stem));
+            let bytes = fs::read(&file_path).unwrap();
+            let account = decode_account_from_bytes(&bytes);
+            map.insert(pubkey, account);
+        }
+
+        map
+    }
+
     #[test]
     fn test_jupiter_integration() {
         // Skip if not in integration test mode
@@ -1370,20 +1439,34 @@ mod tests {
         use solana_transaction::Transaction as RawTransaction;
         use solana_client::rpc_request::TokenAccountsFilter;
 
-        // 1. Build SDK AMM from mainnet snapshot
+        // 1. Build SDK AMM from local snapshot + RPC fallback
         let rpc = RpcClient::new(
             "https://api.mainnet-beta.solana.com",
         );
-        // Byreal (cbBTC-USDC) pool used by aggregator
-        let pool_address =
-            Pubkey::from_str("A5vkCw1VXPNXq5VFbffPm6Bo4kVKAP1UUoRrEn3gyVey").unwrap();
-        // USDC is fixed; cbBTC mint is derived from pool and cross‑checked against the known mint.
-        let usdc_mint = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
+        let snapshot_dir = "./9GTj99g9tbz9U6UYDsX6YeRTgUnkYG6GTnHv3qLa5aXq";
+        let mut account_map: AccountMap = load_snapshot_account_map(snapshot_dir);
 
-        let account = rpc.get_account(&pool_address).unwrap();
+        // Byreal (USDC-SOL) pool used by aggregator
+        let pool_address =
+            Pubkey::from_str("9GTj99g9tbz9U6UYDsX6YeRTgUnkYG6GTnHv3qLa5aXq").unwrap();
+        // USDC is fixed; the other side is SOL (So111...).
+        let usdc_mint = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
+        let sol_mint =
+            Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+
+        // Prefer snapshot for pool account, but fall back to RPC if missing.
+        let pool_account = match account_map.get(&pool_address) {
+            Some(acc) => acc.clone(),
+            None => {
+                let acc = rpc.get_account(&pool_address).unwrap();
+                let sdk_acc: solana_sdk::account::Account = acc.into();
+                account_map.insert(pool_address, sdk_acc.clone());
+                sdk_acc
+            }
+        };
         let keyed_account = KeyedAccount {
             key: pool_address,
-            account: account.into(),
+            account: pool_account,
             params: None,
         };
         let amm_context = AmmContext {
@@ -1395,29 +1478,25 @@ mod tests {
         // including pool state, vaults, config, observation, bitmap extension
         // and all candidate tick array PDAs.
         let accounts_to_update = amm.get_accounts_to_update();
-        let accounts = rpc.get_multiple_accounts(&accounts_to_update).unwrap();
-        let mut account_map: AccountMap = accounts_to_update
-            .iter()
-            .enumerate()
-            .filter_map(|(i, key)| {
-                accounts[i]
-                    .as_ref()
-                    .map(|account| (*key, account.clone().into()))
-                })
-                .collect();
+        for key in &accounts_to_update {
+            if !account_map.contains_key(key) {
+                if let Ok(acc) = rpc.get_account(key) {
+                    account_map.insert(*key, acc.into());
+                }
+            }
+        }
         amm.update(&account_map).unwrap();
 
-        // Derive cbBTC mint from pool state (the non-USDC side) and sanity‑check
-        // against the expected cbBTC mint used by the aggregator.
-        let expected_cb_btc_mint =
-            Pubkey::from_str("cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij").unwrap();
+        // Derive the non-USDC mint from pool state and sanity‑check
+        // against the expected SOL mint used by the aggregator.
+        let expected_cb_btc_mint = sol_mint;
         let cb_btc_mint = if amm.pool_state.token_mint_0 == usdc_mint {
             amm.pool_state.token_mint_1
         } else if amm.pool_state.token_mint_1 == usdc_mint {
             amm.pool_state.token_mint_0
         } else {
             panic!(
-                "Pool {} is not a USDC-cbBTC pool (mints: {}, {})",
+                "Pool {} is not a USDC-SOL pool (mints: {}, {})",
                 pool_address,
                 amm.pool_state.token_mint_0,
                 amm.pool_state.token_mint_1
@@ -1425,45 +1504,9 @@ mod tests {
         };
         assert_eq!(
             cb_btc_mint, expected_cb_btc_mint,
-            "Pool {} cbBTC mint mismatch (pool side vs expected)",
+            "Pool {} SOL mint mismatch (pool side vs expected)",
             pool_address
         );
-
-        // Ensure we have *all* tick array accounts that the on-chain program
-        // may touch, based on the bitmap navigation helpers, not just the
-        // subset returned by get_accounts_to_update(). Otherwise the program
-        // can legitimately throw NotEnoughTickArrayAccount while the SDK
-        // math succeeds.
-        let mut full_tick_addrs: HashSet<Pubkey> = HashSet::new();
-        for &dir in &[true, false] {
-            if let Ok((_, mut start)) =
-                amm.pool_state.get_first_initialized_tick_array(&amm.bitmap_extension, dir)
-            {
-                loop {
-                    full_tick_addrs.insert(amm.get_tick_array_address(start));
-                    match amm.pool_state.next_initialized_tick_array_start_index(
-                        &amm.bitmap_extension,
-                        start,
-                        dir,
-                    ) {
-                        Ok(Some(next)) => {
-                            start = next;
-                        }
-                        _ => break,
-                    }
-                }
-            }
-        }
-        for addr in full_tick_addrs.into_iter() {
-            if !account_map.contains_key(&addr) {
-                if let Ok(acc) = rpc.get_account(&addr) {
-                    account_map.insert(addr, acc.into());
-                }
-            }
-        }
-        // Re-sync AMM with the enriched account map so that both SDK math and
-        // LiteSVM simulation see the same complete tick array set.
-        amm.update(&account_map).unwrap();
 
         // Log decay-fee related configuration for this pool so we can see
         // whether dynamic fee is enabled and on which side it applies.
@@ -1513,8 +1556,8 @@ mod tests {
             println!("CLMM account {} kind={} disc_bytes={:?}", addr, kind, disc);
         }
 
-        // Discover user's cbBTC/USDC token accounts for this test case
-        let user = Pubkey::from_str("DdZR6zRFiUt4S5mg7AV1uKB2z1f1WzcNYCaTEEWPAuby").unwrap();
+        // Discover user's USDC/SOL token accounts for this test case
+        let user = Pubkey::from_str("5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9").unwrap();
         let cb_btc_accounts = rpc
             .get_token_accounts_by_owner(&user, TokenAccountsFilter::Mint(cb_btc_mint))
             .unwrap();
@@ -1522,14 +1565,14 @@ mod tests {
             .get_token_accounts_by_owner(&user, TokenAccountsFilter::Mint(usdc_mint))
             .unwrap();
         if cb_btc_accounts.is_empty() || usdc_accounts.is_empty() {
-            println!("User missing cbBTC or USDC ATA; skipping LiteSVM test.");
+            println!("User missing USDC or SOL ATA; skipping LiteSVM test.");
             return;
         }
         let cb_btc_ata = Pubkey::from_str(&cb_btc_accounts[0].pubkey).unwrap();
         let usdc_ata = Pubkey::from_str(&usdc_accounts[0].pubkey).unwrap();
 
-        // Use the same input amount as the aggregator scenario: 1_250_000 cbBTC base units.
-        let amount_in: u64 = 1_250_000;
+        // Aggregator scenario: USDC -> SOL (ExactIn) with 555_000_000 USDC in.
+        let amount_in: u64 = 555_000_000;
         if amount_in == 0 {
             println!(
                     "User USDC ATA {} has insufficient balance; skipping LiteSVM test.",
@@ -1538,18 +1581,27 @@ mod tests {
             return;
         }
 
-        // SDK quote baseline: cbBTC -> USDC (ExactIn)
+        // SDK quote baseline: USDC -> SOL (ExactIn)
         let sdk_quote = amm
             .quote(&QuoteParams {
                 amount: amount_in,
-                input_mint: cb_btc_mint,
-                output_mint: usdc_mint,
+                input_mint: usdc_mint,
+                output_mint: cb_btc_mint,
                 swap_mode: SwapMode::ExactIn,
             })
             .unwrap();
         println!(
-            "SDK quote: in={}, out={}, fee={}",
-            sdk_quote.in_amount, sdk_quote.out_amount, sdk_quote.fee_amount
+            "{} -> {}",
+            usdc_mint,
+            cb_btc_mint,
+        );
+        println!(
+            "quote: Quote {{ in_amount: {}, out_amount: {}, fee_amount: {}, fee_mint: {}, fee_pct: {} }}",
+            sdk_quote.in_amount,
+            sdk_quote.out_amount,
+            sdk_quote.fee_amount,
+            sdk_quote.fee_mint,
+            sdk_quote.fee_pct,
         );
 
         // 2. Build LiteSVM VM and load Byreal CLMM BPF program
@@ -1562,7 +1614,7 @@ mod tests {
 
         // Path is relative to this crate's src/, use two levels up.
         let program_bytes =
-            include_bytes!("./byreal_clmm.so");
+            include_bytes!("../byreal_clmm.so");
         let clmm_program = RawPubkey::new_from_array(BYREAL_CLMM_PROGRAM.to_bytes());
         svm.add_program(clmm_program, program_bytes).unwrap();
 
@@ -1579,31 +1631,31 @@ mod tests {
             svm.set_account(raw_addr, raw_acc).unwrap();
         }
 
-        // Also write user cbBTC/USDC token accounts from mainnet snapshot.
-        // For cbBTC ATA, ensure the simulated balance is sufficient to
+        // Also write user USDC/SOL token accounts from mainnet snapshot.
+        // For USDC ATA, ensure the simulated balance is sufficient to
         // cover the input amount, so we don't fail with "insufficient
         // funds" while validating math.
         {
-            let acc = rpc.get_account(&cb_btc_ata).unwrap();
-            let mut cbbtc_data = acc.data.clone();
+            let acc = rpc.get_account(&usdc_ata).unwrap();
+            let mut usdc_data = acc.data.clone();
             if let Ok(mut token_acc) =
-                anchor_spl::token::spl_token::state::Account::unpack(&cbbtc_data)
+                anchor_spl::token::spl_token::state::Account::unpack(&usdc_data)
             {
                 if token_acc.amount < amount_in {
                     token_acc.amount = amount_in.saturating_mul(2);
-                    let mut new_data = vec![0u8; cbbtc_data.len()];
+                    let mut new_data = vec![0u8; usdc_data.len()];
                     anchor_spl::token::spl_token::state::Account::pack(
                         token_acc,
                         &mut new_data,
                     )
                     .unwrap();
-                    cbbtc_data = new_data;
+                    usdc_data = new_data;
                 }
             }
-            let raw_addr = RawPubkey::new_from_array(cb_btc_ata.to_bytes());
+            let raw_addr = RawPubkey::new_from_array(usdc_ata.to_bytes());
             let raw_acc = RawAccount {
                 lamports: acc.lamports,
-                data: cbbtc_data,
+                data: usdc_data,
                 owner: RawPubkey::new_from_array(acc.owner.to_bytes()),
                 executable: acc.executable,
                 rent_epoch: acc.rent_epoch,
@@ -1611,8 +1663,8 @@ mod tests {
             svm.set_account(raw_addr, raw_acc).unwrap();
         }
         {
-            let acc = rpc.get_account(&usdc_ata).unwrap();
-            let raw_addr = RawPubkey::new_from_array(usdc_ata.to_bytes());
+            let acc = rpc.get_account(&cb_btc_ata).unwrap();
+            let raw_addr = RawPubkey::new_from_array(cb_btc_ata.to_bytes());
             let raw_acc = RawAccount {
                 lamports: acc.lamports,
                 data: acc.data,
@@ -1634,83 +1686,29 @@ mod tests {
         clock_sysvar.unix_timestamp = (amm.pool_state.open_time as i64).saturating_add(1);
         svm.set_sysvar(&clock_sysvar);
 
-        // 4. Construct swap instruction accounts directly from the snapshot.
-        //    First, follow the on-chain bitmap navigation to compute the
-        //    ordered tick_array start indices in the swap direction, so that
-        //    the tick_array_states queue matches the program's expectations
-        //    and avoids NotEnoughTickArrayAccount due to ordering issues.
-        //    Here we simulate cbBTC -> USDC, so zero_for_one is decided by cbBTC mint.
-        let zero_for_one = cb_btc_mint == amm.pool_state.token_mint_0;
-        let (input_vault, output_vault) = if zero_for_one {
-            (amm.pool_state.token_vault_0, amm.pool_state.token_vault_1)
-        } else {
-            (amm.pool_state.token_vault_1, amm.pool_state.token_vault_0)
+        // 4. Construct swap instruction accounts using the same helper
+        //    that Jupiter uses (`get_swap_and_account_metas`), so that
+        //    tick-array selection and account ordering match the SDK.
+        let jupiter_program = Pubkey::new_unique();
+        let swap_params = SwapParams {
+            swap_mode: SwapMode::ExactIn,
+            in_amount: amount_in,
+            out_amount: sdk_quote.out_amount,
+            source_mint: usdc_mint,
+            destination_mint: cb_btc_mint,
+            source_token_account: usdc_ata,
+            destination_token_account: cb_btc_ata,
+            token_transfer_authority: user,
+            quote_mint_to_referrer: None,
+            jupiter_program_id: &jupiter_program,
+            missing_dynamic_accounts_as_default: false,
         };
 
-        // All accounts in the snapshot that look like tick arrays (used as fallback)
-        let mut all_tick_arrays: Vec<Pubkey> = Vec::new();
-        for (addr, acc) in account_map.iter() {
-            if acc.owner != BYREAL_CLMM_PROGRAM || acc.data.len() < 8 {
-                continue;
-            }
-            let disc = &acc.data[0..8];
-            if disc == DynTickArrayState::DISCRIMINATOR
-                || disc == TickArrayState::DISCRIMINATOR
-            {
-                all_tick_arrays.push(*addr);
-            }
-        }
-        if all_tick_arrays.is_empty() {
-            panic!("No tick array accounts with valid discriminator found in snapshot");
-        }
-
-        // Traverse all initialized tick_array start indices in the current
-        // swap direction using pool_state + bitmap_extension to derive an
-        // ordered list of tick_array addresses.
-        let mut ordered_tick_arrays: Vec<Pubkey> = Vec::new();
-        if let Ok((_, mut start)) =
-            amm.pool_state
-                .get_first_initialized_tick_array(&amm.bitmap_extension, zero_for_one)
-        {
-            loop {
-                let addr = amm.get_tick_array_address(start);
-                if account_map.contains_key(&addr) {
-                    ordered_tick_arrays.push(addr);
-                }
-                match amm.pool_state.next_initialized_tick_array_start_index(
-                    &amm.bitmap_extension,
-                    start,
-                    zero_for_one,
-                ) {
-                    Ok(Some(next)) => {
-                        start = next;
-                    }
-                    _ => break,
-                }
-            }
-        }
-
-        // If bitmap navigation yields nothing (e.g. missing bitmap_extension),
-        // fall back to the full set of known tick_array accounts to ensure
-        // the set is never empty.
-        if ordered_tick_arrays.is_empty() {
-            ordered_tick_arrays.extend(all_tick_arrays.iter().copied());
-        }
-        if ordered_tick_arrays.is_empty() {
-            panic!("No ordered tick array accounts available for swap");
-        }
-
-        println!("Selected tick_array candidates (ordered_tick_arrays):");
-        for addr in ordered_tick_arrays.iter() {
-            if let Some(acc) = account_map.get(addr) {
-                let disc = if acc.data.len() >= 8 {
-                    Some(&acc.data[0..8])
-                } else {
-                    None
-                };
-                println!("- {} disc_bytes={:?}", addr, disc);
-            }
-        }
+        let swap_and_metas = amm.get_swap_and_account_metas(&swap_params).unwrap();
+        println!(
+            "Selected swap accounts (LiteSVM): {}",
+            swap_and_metas.account_metas.len()
+        );
 
         #[derive(anchor_lang::AnchorSerialize, anchor_lang::AnchorDeserialize)]
         struct SwapIxArgs {
@@ -1733,88 +1731,14 @@ mod tests {
             .unwrap(),
         );
 
-        // Build accounts following byreal_clmm `swap` IDL:
-        // payer, amm_config, pool_state, input_token_account, output_token_account,
-        // input_vault, output_vault, observation_state, token_program, tick_array,
-        // then remaining_accounts: bitmap extension (if any) + other tick arrays,
-        // in the exact order computed in ordered_tick_arrays.
+        // Build accounts following byreal_clmm `swap` IDL based on
+        // the Jupiter `account_metas` we just computed.
         let mut accounts: Vec<RawAccountMeta> = Vec::new();
-
-        // payer (signer)
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(user.to_bytes()),
-            is_signer: true,
-            is_writable: false,
-        });
-        // amm_config
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(amm.pool_state.amm_config.to_bytes()),
-            is_signer: false,
-            is_writable: false,
-        });
-        // pool_state
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(amm.key.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        // input / output user token accounts (cbBTC -> USDC)
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(cb_btc_ata.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(usdc_ata.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        // input / output vaults
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(input_vault.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(output_vault.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        // observation_state
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(amm.pool_state.observation_key.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        // token_program
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(anchor_spl::token::ID.to_bytes()),
-            is_signer: false,
-            is_writable: false,
-        });
-
-        // Primary tick array (named account in SwapSingle)
-        let primary_tick_array = ordered_tick_arrays[0];
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(primary_tick_array.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-
-        // Remaining accounts: bitmap extension (if present) then other tick arrays
-        let bitmap_key = TickArrayBitmapExtension::key(amm.key);
-        if account_map.contains_key(&bitmap_key) {
+        for meta in swap_and_metas.account_metas.iter() {
             accounts.push(RawAccountMeta {
-                pubkey: RawPubkey::new_from_array(bitmap_key.to_bytes()),
-                is_signer: false,
-                is_writable: false,
-            });
-        }
-        for addr in ordered_tick_arrays.iter().skip(1) {
-            accounts.push(RawAccountMeta {
-                pubkey: RawPubkey::new_from_array(addr.to_bytes()),
-                is_signer: false,
-                is_writable: true,
+                pubkey: RawPubkey::new_from_array(meta.pubkey.to_bytes()),
+                is_signer: meta.is_signer,
+                is_writable: meta.is_writable,
             });
         }
 
@@ -1841,527 +1765,43 @@ mod tests {
         #[cfg(feature = "debug-swap-steps")]
         println!("LiteSVM logs: {:?}", sim.meta.logs);
 
-        // Find post-simulated USDC ATA and compute out amount
-        let usdc_raw = RawPubkey::new_from_array(usdc_ata.to_bytes());
-        let mut post_usdc_amount: Option<u64> = None;
+        // Find post-simulated SOL ATA and compute out amount
+        let sol_raw = RawPubkey::new_from_array(cb_btc_ata.to_bytes());
+        let mut post_sol_amount: Option<u64> = None;
         for (pk, acc) in sim.post_accounts.iter() {
-            if *pk == usdc_raw {
+            if *pk == sol_raw {
                 let raw: RawAccount = (*acc).clone().into();
                 if let Ok(token_acc) =
                     anchor_spl::token::spl_token::state::Account::unpack(&raw.data)
                 {
-                    post_usdc_amount = Some(token_acc.amount);
+                    post_sol_amount = Some(token_acc.amount);
                 }
             }
         }
 
-        if post_usdc_amount.is_none() {
-            println!("LiteSVM did not modify USDC ATA; logs: {:?}", sim.meta.logs);
+        if post_sol_amount.is_none() {
+            println!("LiteSVM did not modify SOL ATA; logs: {:?}", sim.meta.logs);
             return;
         }
 
-        let pre_usdc_acc = rpc.get_account(&usdc_ata).unwrap();
-        let pre_usdc_token =
-            anchor_spl::token::spl_token::state::Account::unpack(&pre_usdc_acc.data).unwrap();
-        let pre_amount = pre_usdc_token.amount;
-        let post_amount = post_usdc_amount.unwrap();
+        // Fetch pre-simulated SOL ATA from mainnet snapshot (RPC).
+        let pre_sol_acc = rpc.get_account(&cb_btc_ata).unwrap();
+        let pre_sol_token =
+            anchor_spl::token::spl_token::state::Account::unpack(&pre_sol_acc.data).unwrap();
+        let pre_amount = pre_sol_token.amount;
+        let post_amount = post_sol_amount.unwrap();
         let litesvm_out = post_amount.saturating_sub(pre_amount);
 
+        let user_diff = litesvm_out as i128 - sdk_quote.out_amount as i128;
         println!(
-            "LiteSVM out={}, diff (sdk_math - litesvm)={}",
+            "quote.out_amount: {}, simulation_out_amount: {}, exact_in_amount: {}, simulation_in_amount: {}, user_diff: {}",
+            sdk_quote.out_amount,
             litesvm_out,
-            sdk_quote.out_amount.saturating_sub(litesvm_out)
+            amount_in,
+            amount_in,
+            user_diff,
         );
 
         // In ideal case we expect exact match; for now just print diff for inspection.
-    }
-
-    /// LiteSVM vs SDK quote test (ExactOut) for the Byreal cbBTC/USDC CLMM pool.
-    ///
-    /// Scenario:
-    /// - Same pool / snapshot as `test_litesvm_vs_sdk_byreal_jup_usdc`;
-    /// - Direction: cbBTC -> USDC, user wants EXACT_OUT of 2000 USDC;
-    /// - SDK computes the required cbBTC input via `SwapMode::ExactOut`;
-    /// - LiteSVM simulates the on-chain `swap` with `is_base_input = false`;
-    /// - We compare the required cbBTC input between SDK math and LiteSVM.
-    #[cfg(feature = "with-litesvm")]
-    #[test]
-    #[ignore]
-    fn test_litesvm_vs_sdk_byreal_jup_usdc_exact_out() {
-        use litesvm::LiteSVM;
-        use solana_clock::Clock as RawClock;
-        use solana_account::Account as RawAccount;
-        use solana_pubkey::Pubkey as RawPubkey;
-        use solana_instruction::{account_meta::AccountMeta as RawAccountMeta, Instruction as RawInstruction};
-        use solana_message::Message as RawMessage;
-        use solana_transaction::Transaction as RawTransaction;
-        use solana_client::rpc_request::TokenAccountsFilter;
-
-        // 1. Build SDK AMM from mainnet snapshot
-        let rpc = RpcClient::new(
-            "https://api.mainnet-beta.solana.com",
-        );
-        let pool_address =
-            Pubkey::from_str("A5vkCw1VXPNXq5VFbffPm6Bo4kVKAP1UUoRrEn3gyVey").unwrap();
-        let usdc_mint = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
-
-        let account = rpc.get_account(&pool_address).unwrap();
-        let keyed_account = KeyedAccount {
-            key: pool_address,
-            account: account.into(),
-            params: None,
-        };
-        let amm_context = AmmContext {
-            clock_ref: ClockRef::default(),
-        };
-        let mut amm = ByrealClmmAmm::from_keyed_account(&keyed_account, &amm_context).unwrap();
-
-        // Pull all relevant accounts (pool, vaults, config, observation, bitmap, tick arrays).
-        let accounts_to_update = amm.get_accounts_to_update();
-        let accounts = rpc.get_multiple_accounts(&accounts_to_update).unwrap();
-        let mut account_map: AccountMap = accounts_to_update
-            .iter()
-            .enumerate()
-            .filter_map(|(i, key)| {
-                accounts[i]
-                    .as_ref()
-                    .map(|account| (*key, account.clone().into()))
-            })
-            .collect();
-        amm.update(&account_map).unwrap();
-
-        // Derive cbBTC mint from pool state (the non-USDC side) and sanity-check
-        // against the expected cbBTC mint used by the aggregator.
-        let expected_cb_btc_mint =
-            Pubkey::from_str("cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij").unwrap();
-        let cb_btc_mint = if amm.pool_state.token_mint_0 == usdc_mint {
-            amm.pool_state.token_mint_1
-        } else if amm.pool_state.token_mint_1 == usdc_mint {
-            amm.pool_state.token_mint_0
-        } else {
-            panic!(
-                "Pool {} is not a USDC-cbBTC pool (mints: {}, {})",
-                pool_address,
-                amm.pool_state.token_mint_0,
-                amm.pool_state.token_mint_1
-            );
-        };
-        assert_eq!(
-            cb_btc_mint, expected_cb_btc_mint,
-            "Pool {} cbBTC mint mismatch (pool side vs expected)",
-            pool_address
-        );
-
-        // Enrich tick-array snapshot via bitmap navigation (both directions).
-        let mut full_tick_addrs: HashSet<Pubkey> = HashSet::new();
-        for &dir in &[true, false] {
-            if let Ok((_, mut start)) =
-                amm.pool_state.get_first_initialized_tick_array(&amm.bitmap_extension, dir)
-            {
-                loop {
-                    full_tick_addrs.insert(amm.get_tick_array_address(start));
-                    match amm.pool_state.next_initialized_tick_array_start_index(
-                        &amm.bitmap_extension,
-                        start,
-                        dir,
-                    ) {
-                        Ok(Some(next)) => {
-                            start = next;
-                        }
-                        _ => break,
-                    }
-                }
-            }
-        }
-        for addr in full_tick_addrs.into_iter() {
-            if !account_map.contains_key(&addr) {
-                if let Ok(acc) = rpc.get_account(&addr) {
-                    account_map.insert(addr, acc.into());
-                }
-            }
-        }
-        amm.update(&account_map).unwrap();
-
-        // Log decay-fee configuration for this pool.
-        println!(
-            "Pool decay_fee_flag={}, init_rate={}, decrease_rate={}, interval={}",
-            amm.pool_state.decay_fee_flag,
-            amm.pool_state.decay_fee_init_fee_rate,
-            amm.pool_state.decay_fee_decrease_rate,
-            amm.pool_state.decay_fee_decrease_interval,
-        );
-        println!(
-            "Decay fee enabled={}, on_sell_mint0={}, on_sell_mint1={}",
-            amm.is_decay_fee_enabled(),
-            amm.is_decay_fee_on_sell_mint0(),
-            amm.is_decay_fee_on_sell_mint1(),
-        );
-        println!(
-            "Base trade_fee_rate={}, protocol_fee_rate={}, fund_fee_rate={}",
-            amm.amm_config.trade_fee_rate,
-            amm.amm_config.protocol_fee_rate,
-            amm.amm_config.fund_fee_rate,
-        );
-
-        // CLMM-owned accounts and their discriminators (for debugging).
-        println!(
-            "TickArrayState discriminator (SDK): {:?}",
-            TickArrayState::DISCRIMINATOR
-        );
-        println!(
-            "DynTickArrayState discriminator (SDK): {:?}",
-            DynTickArrayState::DISCRIMINATOR
-        );
-        for (addr, acc) in account_map.iter() {
-            if acc.owner != BYREAL_CLMM_PROGRAM || acc.data.len() < 8 {
-                continue;
-            }
-            let disc = &acc.data[0..8];
-            let kind = if disc == TickArrayState::DISCRIMINATOR {
-                "fixed_tick_array"
-            } else if disc == DynTickArrayState::DISCRIMINATOR {
-                "dyn_tick_array"
-            } else {
-                "other_clmm_account"
-            };
-            println!("CLMM account {} kind={} disc_bytes={:?}", addr, kind, disc);
-        }
-
-        // Discover user's cbBTC/USDC token accounts (reuse the same authority as the ExactIn test).
-        let user = Pubkey::from_str("DdZR6zRFiUt4S5mg7AV1uKB2z1f1WzcNYCaTEEWPAuby").unwrap();
-        let cb_btc_accounts = rpc
-            .get_token_accounts_by_owner(&user, TokenAccountsFilter::Mint(cb_btc_mint))
-            .unwrap();
-        let usdc_accounts = rpc
-            .get_token_accounts_by_owner(&user, TokenAccountsFilter::Mint(usdc_mint))
-            .unwrap();
-        if cb_btc_accounts.is_empty() || usdc_accounts.is_empty() {
-            println!(
-                "User {} missing cbBTC or USDC ATA; skipping ExactOut LiteSVM test.",
-                user
-            );
-            return;
-        }
-        let cb_btc_ata = Pubkey::from_str(&cb_btc_accounts[0].pubkey).unwrap();
-        let usdc_ata = Pubkey::from_str(&usdc_accounts[0].pubkey).unwrap();
-
-        // Desired exact-out amount: 2000 USDC (6 decimals).
-        let desired_out: u64 = 2_000_000_000;
-
-        // SDK quote baseline: cbBTC -> USDC (ExactOut)
-        let sdk_quote = amm
-            .quote(&QuoteParams {
-                amount: desired_out,
-                input_mint: cb_btc_mint,
-                output_mint: usdc_mint,
-                swap_mode: SwapMode::ExactOut,
-            })
-            .unwrap();
-        println!(
-            "SDK exact-out quote: in={} (cbBTC), out={} (USDC), fee={}",
-            sdk_quote.in_amount, sdk_quote.out_amount, sdk_quote.fee_amount
-        );
-
-        // 2. Build LiteSVM VM and load Byreal CLMM BPF program
-        let mut svm = LiteSVM::new()
-            .with_sysvars()
-            .with_builtins()
-            .with_default_programs()
-            .with_sigverify(false)
-            .with_blockhash_check(false);
-
-        let program_bytes =
-            include_bytes!("./byreal_clmm.so");
-        let clmm_program = RawPubkey::new_from_array(BYREAL_CLMM_PROGRAM.to_bytes());
-        svm.add_program(clmm_program, program_bytes).unwrap();
-
-        // 3. Write pool/tick/aux accounts into LiteSVM
-        for (addr, acc) in account_map.iter() {
-            let raw_addr = RawPubkey::new_from_array(addr.to_bytes());
-            let raw_acc = RawAccount {
-                lamports: acc.lamports,
-                data: acc.data.clone(),
-                owner: RawPubkey::new_from_array(acc.owner.to_bytes()),
-                executable: acc.executable,
-                rent_epoch: acc.rent_epoch,
-            };
-            svm.set_account(raw_addr, raw_acc).unwrap();
-        }
-
-        // Also write user cbBTC/USDC token accounts. For cbBTC ATA, ensure the
-        // simulated balance is sufficient to cover the SDK-computed required
-        // input amount, so that we do not fail with "insufficient funds" while
-        // validating the math.
-        {
-            // cbBTC ATA with topped-up balance in the LiteSVM VM
-            let acc = rpc.get_account(&cb_btc_ata).unwrap();
-            let mut cbbtc_data = acc.data.clone();
-            if let Ok(mut token_acc) =
-                anchor_spl::token::spl_token::state::Account::unpack(&cbbtc_data)
-            {
-                if token_acc.amount < sdk_quote.in_amount {
-                    token_acc.amount = sdk_quote.in_amount.saturating_mul(2);
-                    let mut new_data = vec![0u8; cbbtc_data.len()];
-                    anchor_spl::token::spl_token::state::Account::pack(
-                        token_acc,
-                        &mut new_data,
-                    )
-                    .unwrap();
-                    cbbtc_data = new_data;
-                }
-            }
-            let raw_addr = RawPubkey::new_from_array(cb_btc_ata.to_bytes());
-            let raw_acc = RawAccount {
-                lamports: acc.lamports,
-                data: cbbtc_data,
-                owner: RawPubkey::new_from_array(acc.owner.to_bytes()),
-                executable: acc.executable,
-                rent_epoch: acc.rent_epoch,
-            };
-            svm.set_account(raw_addr, raw_acc).unwrap();
-        }
-        {
-            // USDC ATA unchanged
-            let acc = rpc.get_account(&usdc_ata).unwrap();
-            let raw_addr = RawPubkey::new_from_array(usdc_ata.to_bytes());
-            let raw_acc = RawAccount {
-                lamports: acc.lamports,
-                data: acc.data,
-                owner: RawPubkey::new_from_array(acc.owner.to_bytes()),
-                executable: acc.executable,
-                rent_epoch: acc.rent_epoch,
-            };
-            svm.set_account(raw_addr, raw_acc).unwrap();
-        }
-
-        // Ensure user lamport account exists in LiteSVM via airdrop
-        let user_raw = RawPubkey::new_from_array(user.to_bytes());
-        svm.airdrop(&user_raw, 1_000_000_000).unwrap();
-
-        // Align LiteSVM clock so that swap pool is considered "open".
-        let mut clock_sysvar: RawClock = svm.get_sysvar();
-        clock_sysvar.unix_timestamp = (amm.pool_state.open_time as i64).saturating_add(1);
-        svm.set_sysvar(&clock_sysvar);
-
-        // 4. Construct swap instruction accounts + data (ExactOut).
-        let zero_for_one = cb_btc_mint == amm.pool_state.token_mint_0;
-        let (input_vault, output_vault) = if zero_for_one {
-            (amm.pool_state.token_vault_0, amm.pool_state.token_vault_1)
-        } else {
-            (amm.pool_state.token_vault_1, amm.pool_state.token_vault_0)
-        };
-
-        // Ordered tick arrays in swap direction.
-        let mut all_tick_arrays: Vec<Pubkey> = Vec::new();
-        for (addr, acc) in account_map.iter() {
-            if acc.owner != BYREAL_CLMM_PROGRAM || acc.data.len() < 8 {
-                continue;
-            }
-            let disc = &acc.data[0..8];
-            if disc == DynTickArrayState::DISCRIMINATOR
-                || disc == TickArrayState::DISCRIMINATOR
-            {
-                all_tick_arrays.push(*addr);
-            }
-        }
-        if all_tick_arrays.is_empty() {
-            panic!("No tick array accounts with valid discriminator found in snapshot");
-        }
-
-        let mut ordered_tick_arrays: Vec<Pubkey> = Vec::new();
-        if let Ok((_, mut start)) =
-            amm.pool_state
-                .get_first_initialized_tick_array(&amm.bitmap_extension, zero_for_one)
-        {
-            loop {
-                let addr = amm.get_tick_array_address(start);
-                if account_map.contains_key(&addr) {
-                    ordered_tick_arrays.push(addr);
-                }
-                match amm.pool_state.next_initialized_tick_array_start_index(
-                    &amm.bitmap_extension,
-                    start,
-                    zero_for_one,
-                ) {
-                    Ok(Some(next)) => {
-                        start = next;
-                    }
-                    _ => break,
-                }
-            }
-        }
-        if ordered_tick_arrays.is_empty() {
-            ordered_tick_arrays.extend(all_tick_arrays.iter().copied());
-        }
-        if ordered_tick_arrays.is_empty() {
-            panic!("No ordered tick array accounts available for swap");
-        }
-        println!("Selected tick_array candidates (ordered_tick_arrays):");
-        for addr in ordered_tick_arrays.iter() {
-            if let Some(acc) = account_map.get(addr) {
-                let disc = if acc.data.len() >= 8 {
-                    Some(&acc.data[0..8])
-                } else {
-                    None
-                };
-                println!("- {} disc_bytes={:?}", addr, disc);
-            }
-        }
-
-        #[derive(anchor_lang::AnchorSerialize, anchor_lang::AnchorDeserialize)]
-        struct SwapIxArgs {
-            amount: u64,
-            other_amount_threshold: u64,
-            sqrt_price_limit_x64: u128,
-            is_base_input: bool,
-        }
-
-        // Use ExactOut semantics: amount = desired USDC out, is_base_input = false.
-        // Set other_amount_threshold to sdk_quote.in_amount so that the on-chain
-        // slippage check matches the SDK's computed min input.
-        let mut data = vec![248u8, 198, 158, 145, 225, 117, 135, 200];
-        data.extend(
-            SwapIxArgs {
-                amount: desired_out,
-                other_amount_threshold: sdk_quote.in_amount,
-                sqrt_price_limit_x64: 0,
-                is_base_input: false,
-            }
-            .try_to_vec()
-            .unwrap(),
-        );
-
-        // Accounts: payer, amm_config, pool_state, input/output token accounts,
-        // vaults, observation, token_program, primary tick_array, bitmap extension, remaining arrays.
-        let mut accounts: Vec<RawAccountMeta> = Vec::new();
-
-        // payer
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(user.to_bytes()),
-            is_signer: true,
-            is_writable: false,
-        });
-        // amm_config
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(amm.pool_state.amm_config.to_bytes()),
-            is_signer: false,
-            is_writable: false,
-        });
-        // pool_state
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(amm.key.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        // input/output user token accounts (cbBTC -> USDC)
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(cb_btc_ata.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(usdc_ata.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        // input / output vaults
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(input_vault.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(output_vault.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        // observation_state
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(amm.pool_state.observation_key.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-        // token_program
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(anchor_spl::token::ID.to_bytes()),
-            is_signer: false,
-            is_writable: false,
-        });
-
-        // primary tick_array
-        let primary_tick_array = ordered_tick_arrays[0];
-        accounts.push(RawAccountMeta {
-            pubkey: RawPubkey::new_from_array(primary_tick_array.to_bytes()),
-            is_signer: false,
-            is_writable: true,
-        });
-
-        // bitmap extension + remaining tick arrays
-        let bitmap_key = TickArrayBitmapExtension::key(amm.key);
-        if account_map.contains_key(&bitmap_key) {
-            accounts.push(RawAccountMeta {
-                pubkey: RawPubkey::new_from_array(bitmap_key.to_bytes()),
-                is_signer: false,
-                is_writable: false,
-            });
-        }
-        for addr in ordered_tick_arrays.iter().skip(1) {
-            accounts.push(RawAccountMeta {
-                pubkey: RawPubkey::new_from_array(addr.to_bytes()),
-                is_signer: false,
-                is_writable: true,
-            });
-        }
-
-        let raw_ix = RawInstruction {
-            program_id: clmm_program,
-            accounts,
-            data,
-        };
-
-        let msg = RawMessage::new(&[raw_ix], Some(&user_raw));
-        let tx = RawTransaction::new_unsigned(msg);
-
-        // 5. Simulate transaction in LiteSVM
-        let sim = svm
-            .simulate_transaction(tx)
-            .expect("LiteSVM simulate_transaction (ExactOut) should succeed");
-
-        #[cfg(feature = "debug-swap-steps")]
-        println!("LiteSVM exact-out logs: {:?}", sim.meta.logs);
-
-        // Compute cbBTC input from pre/post cbBTC ATA.
-        let cb_btc_raw = RawPubkey::new_from_array(cb_btc_ata.to_bytes());
-        let mut post_cb_btc_amount: Option<u64> = None;
-        for (pk, acc) in sim.post_accounts.iter() {
-            if *pk == cb_btc_raw {
-                let raw: RawAccount = (*acc).clone().into();
-                if let Ok(token_acc) =
-                    anchor_spl::token::spl_token::state::Account::unpack(&raw.data)
-                {
-                    post_cb_btc_amount = Some(token_acc.amount);
-                }
-            }
-        }
-        if post_cb_btc_amount.is_none() {
-            println!(
-                "LiteSVM (ExactOut) did not modify cbBTC ATA; logs: {:?}",
-                sim.meta.logs
-            );
-            return;
-        }
-
-        let pre_cb_btc_acc = rpc.get_account(&cb_btc_ata).unwrap();
-        let pre_cb_btc_token =
-            anchor_spl::token::spl_token::state::Account::unpack(&pre_cb_btc_acc.data).unwrap();
-        let pre_in = pre_cb_btc_token.amount;
-        let post_in = post_cb_btc_amount.unwrap();
-        let litesvm_in = pre_in.saturating_sub(post_in);
-
-        println!(
-            "LiteSVM ExactOut in_cbBTC={}, diff (sdk_in - litesvm_in)={}",
-            litesvm_in,
-            sdk_quote.in_amount.saturating_sub(litesvm_in)
-        );
     }
 }
