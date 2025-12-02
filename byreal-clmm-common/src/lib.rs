@@ -165,6 +165,10 @@ pub struct ByrealClmmAmm {
     pub bitmap_extension: Option<TickArrayBitmapExtension>,
     pub max_one_side_tick_arrays: usize,
     pub dynamic_tick_arrays: HashMap<Pubkey, DynamicTickArrayState>,
+    /// Cache of start_index -> tick array PDA to avoid repeated PDA grinding on hot paths
+    pub tick_array_pda_cache: HashMap<i32, Pubkey>,
+    /// Cached list of tick array addresses gathered during the last update
+    pub cached_tick_array_addresses: Vec<Pubkey>,
 }
 
 impl ByrealClmmAmm {
@@ -261,7 +265,10 @@ impl ByrealClmmAmm {
 
     /// Get the tick array PDA address
     pub fn get_tick_array_address(&self, start_index: i32) -> Pubkey {
-        Pubkey::find_program_address(
+        if let Some(addr) = self.tick_array_pda_cache.get(&start_index) {
+            return *addr;
+        }
+        let addr = Pubkey::find_program_address(
             &[
                 TICK_ARRAY_SEED.as_bytes(),
                 self.key.as_ref(),
@@ -269,7 +276,8 @@ impl ByrealClmmAmm {
             ],
             &BYREAL_CLMM_PROGRAM,
         )
-        .0
+        .0;
+        addr
     }
 
     /// Get tick array addresses around current price using bitmap navigation (both directions).
@@ -326,6 +334,68 @@ impl ByrealClmmAmm {
             .into_iter()
             .map(|s| self.get_tick_array_address(s))
             .collect()
+    }
+
+    /// Recompute and cache tick array PDAs (addresses) for both directions.
+    /// Populates `tick_array_pda_cache` and `cached_tick_array_addresses`.
+    pub fn refresh_tick_array_cache(&mut self) {
+        self.tick_array_pda_cache.clear();
+        let mut addrs: Vec<Pubkey> = Vec::new();
+
+        let mut start_indexes: BTreeSet<i32> = BTreeSet::new();
+
+        let mut collect_dir = |zero_for_one: bool, limit: usize, start_indexes: &mut BTreeSet<i32>| {
+            if limit == 0 {
+                return;
+            }
+            if let Ok((_, mut start)) = self
+                .pool_state
+                .get_first_initialized_tick_array(&self.bitmap_extension, zero_for_one)
+            {
+                start_indexes.insert(start);
+                for _ in 1..limit {
+                    match self.pool_state.next_initialized_tick_array_start_index(
+                        &self.bitmap_extension,
+                        start,
+                        zero_for_one,
+                    ) {
+                        Ok(Some(next)) => {
+                            start_indexes.insert(next);
+                            start = next;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        };
+
+        let overflow_default = self
+            .pool_state
+            .is_overflow_default_tickarray_bitmap(vec![self.pool_state.tick_current]);
+        let can_use_bitmap_helpers = self.bitmap_extension.is_some() || !overflow_default;
+        if can_use_bitmap_helpers {
+            collect_dir(true, self.max_one_side_tick_arrays, &mut start_indexes);
+            collect_dir(false, self.max_one_side_tick_arrays, &mut start_indexes);
+        }
+
+        if start_indexes.is_empty() {
+            let tick_spacing = self.pool_state.tick_spacing;
+            let current_tick = self.pool_state.tick_current;
+            let current_start_index = TickUtils::get_array_start_index(current_tick, tick_spacing);
+            start_indexes.insert(current_start_index);
+            for i in 1..self.max_one_side_tick_arrays {
+                let offset = (TICK_ARRAY_SIZE * i as i32) * i32::from(tick_spacing);
+                start_indexes.insert(current_start_index.saturating_sub(offset));
+            }
+        }
+
+        for s in start_indexes.into_iter() {
+            let addr = self.get_tick_array_address(s);
+            self.tick_array_pda_cache.insert(s, addr);
+            addrs.push(addr);
+        }
+
+        self.cached_tick_array_addresses = addrs;
     }
 
     /// Check if decay fee is enabled

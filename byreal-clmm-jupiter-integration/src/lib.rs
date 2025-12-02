@@ -52,6 +52,8 @@ impl Amm for ByrealClmm {
                 bitmap_extension: Some(TickArrayBitmapExtension::default()),
                 max_one_side_tick_arrays: 3, // 3 extra tick arrays
                 dynamic_tick_arrays: HashMap::new(),
+                tick_array_pda_cache: HashMap::new(),
+                cached_tick_array_addresses: Vec::new(),
             },
             timestamp: amm_context.clock_ref.unix_timestamp.clone(),
         })
@@ -85,7 +87,11 @@ impl Amm for ByrealClmm {
         let bitmap_key = TickArrayBitmapExtension::key(self.key);
         accounts.push(bitmap_key);
 
-        accounts.extend(self.amm.get_all_tick_array_addresses());
+        if !self.amm.cached_tick_array_addresses.is_empty() {
+            accounts.extend(self.amm.cached_tick_array_addresses.iter().copied());
+        } else {
+            accounts.extend(self.amm.get_all_tick_array_addresses());
+        }
         accounts
     }
 
@@ -108,7 +114,8 @@ impl Amm for ByrealClmm {
 
         // Update tick arrays
         self.amm.dynamic_tick_arrays.clear();
-        for address in self.amm.get_all_tick_array_addresses() {
+        self.amm.refresh_tick_array_cache();
+        for &address in &self.amm.cached_tick_array_addresses {
             if let Ok(tick_array_data) = try_get_account_data(account_map, &address) {
                 if let Some(tick_array) = DynamicTickArrayState::from_bytes(tick_array_data) {
                     self.amm.dynamic_tick_arrays.insert(address, tick_array);
@@ -393,6 +400,8 @@ mod tests {
             pool_state: PoolState::default(),
             amm_config: AmmConfig::default(),
             dynamic_tick_arrays: HashMap::new(),
+            tick_array_pda_cache: HashMap::new(),
+            cached_tick_array_addresses: Vec::new(),
             max_one_side_tick_arrays: 3,
             bitmap_extension: None,
         };
@@ -420,6 +429,8 @@ mod tests {
             pool_state,
             amm_config: AmmConfig::default(),
             dynamic_tick_arrays: HashMap::new(),
+            tick_array_pda_cache: HashMap::new(),
+            cached_tick_array_addresses: Vec::new(),
             max_one_side_tick_arrays: 3,
             bitmap_extension: None,
         };
@@ -457,6 +468,8 @@ mod tests {
             pool_state,
             amm_config: AmmConfig::default(),
             dynamic_tick_arrays: HashMap::new(),
+            tick_array_pda_cache: HashMap::new(),
+            cached_tick_array_addresses: Vec::new(),
             max_one_side_tick_arrays: 3,
             bitmap_extension: None,
         };
@@ -506,6 +519,8 @@ mod tests {
             pool_state,
             amm_config: AmmConfig::default(),
             dynamic_tick_arrays: HashMap::new(),
+            tick_array_pda_cache: HashMap::new(),
+            cached_tick_array_addresses: Vec::new(),
             max_one_side_tick_arrays: 3,
             bitmap_extension: None,
         };
@@ -529,6 +544,8 @@ mod tests {
             pool_state,
             amm_config: AmmConfig::default(),
             dynamic_tick_arrays: HashMap::new(),
+            tick_array_pda_cache: HashMap::new(),
+            cached_tick_array_addresses: Vec::new(),
             max_one_side_tick_arrays: 3,
             bitmap_extension: None,
         };
@@ -541,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_dyn_tick_array_and_next_tick() {
+    fn test_decode_dyn_tick_array_and_next_tick() -> Result<()> {
         // Helper to build a minimal dynamic tick array bytes blob
         fn build_dyn_bytes(start: i32, spacing: u16, offsets: &[usize]) -> Vec<u8> {
             let mut header = DynTickArrayState::default();
@@ -573,7 +590,7 @@ mod tests {
 
         let (header, ticks) = match DynamicTickArrayState::from_bytes(&bytes).unwrap() {
             DynamicTickArrayState::Dynamic(inner) => inner,
-            _ => panic!("Expected Dynamic variant"),
+            _ => return Err(anyhow!("Expected Dynamic variant")),
         };
         let header_start = header.start_tick_index;
         assert_eq!(header_start, start);
@@ -601,6 +618,8 @@ mod tests {
         let idx_up = header.first_initialized_tick_index(&ticks, false).unwrap();
         let tick_up = ticks[idx_up as usize].tick;
         assert_eq!(tick_up, start);
+
+        Ok(())
     }
 
     #[test]
@@ -621,6 +640,8 @@ mod tests {
             pool_state,
             amm_config: AmmConfig::default(),
             dynamic_tick_arrays: HashMap::new(),
+            tick_array_pda_cache: HashMap::new(),
+            cached_tick_array_addresses: Vec::new(),
             max_one_side_tick_arrays: 3,
             bitmap_extension: None,
         };
@@ -642,7 +663,7 @@ mod tests {
     #[cfg(feature = "with-litesvm")]
     #[test]
     #[ignore]
-    fn test_litesvm_vs_sdk_byreal_jup_usdc() {
+    fn test_litesvm_vs_sdk_byreal_jup_usdc() -> Result<()> {
         use litesvm::LiteSVM;
         use solana_account::Account as RawAccount;
         use solana_client::rpc_request::TokenAccountsFilter;
@@ -698,10 +719,12 @@ mod tests {
         } else if amm.pool_state.token_mint_1 == usdc_mint {
             amm.pool_state.token_mint_0
         } else {
-            panic!(
+            return Err(anyhow!(
                 "Pool {} is not a USDC-cbBTC pool (mints: {}, {})",
-                pool_address, amm.pool_state.token_mint_0, amm.pool_state.token_mint_1
-            );
+                pool_address,
+                amm.pool_state.token_mint_0,
+                amm.pool_state.token_mint_1
+            ));
         };
         assert_eq!(
             cb_btc_mint, expected_cb_btc_mint,
@@ -936,7 +959,9 @@ mod tests {
             }
         }
         if all_tick_arrays.is_empty() {
-            panic!("No tick array accounts with valid discriminator found in snapshot");
+            return Err(anyhow!(
+                "No tick array accounts with valid discriminator found in snapshot"
+            ));
         }
 
         // Traverse all initialized tick_array start indices in the current
@@ -972,7 +997,7 @@ mod tests {
             ordered_tick_arrays.extend(all_tick_arrays.iter().copied());
         }
         if ordered_tick_arrays.is_empty() {
-            panic!("No ordered tick array accounts available for swap");
+            return Err(anyhow!("No ordered tick array accounts available for swap"));
         }
 
         println!("Selected tick_array candidates (ordered_tick_arrays):");
@@ -1132,7 +1157,7 @@ mod tests {
 
         if post_usdc_amount.is_none() {
             println!("LiteSVM did not modify USDC ATA; logs: {:?}", sim.meta.logs);
-            return;
+            return Ok(());
         }
 
         let pre_usdc_acc = rpc.get_account(&usdc_ata).unwrap();
@@ -1149,6 +1174,7 @@ mod tests {
         );
 
         // In ideal case we expect exact match; for now just print diff for inspection.
+        Ok(())
     }
 
     /// LiteSVM vs SDK quote test (ExactOut) for the Byreal cbBTC/USDC CLMM pool.
@@ -1162,7 +1188,7 @@ mod tests {
     #[cfg(feature = "with-litesvm")]
     #[test]
     #[ignore]
-    fn test_litesvm_vs_sdk_byreal_jup_usdc_exact_out() {
+    fn test_litesvm_vs_sdk_byreal_jup_usdc_exact_out() -> Result<()> {
         use litesvm::LiteSVM;
         use solana_account::Account as RawAccount;
         use solana_client::rpc_request::TokenAccountsFilter;
@@ -1214,10 +1240,12 @@ mod tests {
         } else if amm.pool_state.token_mint_1 == usdc_mint {
             amm.pool_state.token_mint_0
         } else {
-            panic!(
+            return Err(anyhow!(
                 "Pool {} is not a USDC-cbBTC pool (mints: {}, {})",
-                pool_address, amm.pool_state.token_mint_0, amm.pool_state.token_mint_1
-            );
+                pool_address,
+                amm.pool_state.token_mint_0,
+                amm.pool_state.token_mint_1
+            ));
         };
         assert_eq!(
             cb_btc_mint, expected_cb_btc_mint,
@@ -1433,7 +1461,9 @@ mod tests {
             }
         }
         if all_tick_arrays.is_empty() {
-            panic!("No tick array accounts with valid discriminator found in snapshot");
+            return Err(anyhow!(
+                "No tick array accounts with valid discriminator found in snapshot"
+            ));
         }
 
         let mut ordered_tick_arrays: Vec<Pubkey> = Vec::new();
@@ -1462,7 +1492,7 @@ mod tests {
             ordered_tick_arrays.extend(all_tick_arrays.iter().copied());
         }
         if ordered_tick_arrays.is_empty() {
-            panic!("No ordered tick array accounts available for swap");
+            return Err(anyhow!("No ordered tick array accounts available for swap"));
         }
         println!("Selected tick_array candidates (ordered_tick_arrays):");
         for addr in ordered_tick_arrays.iter() {
@@ -1616,7 +1646,7 @@ mod tests {
                 "LiteSVM (ExactOut) did not modify cbBTC ATA; logs: {:?}",
                 sim.meta.logs
             );
-            return;
+            return Ok(());
         }
 
         let pre_cb_btc_acc = rpc.get_account(&cb_btc_ata).unwrap();
@@ -1631,5 +1661,7 @@ mod tests {
             litesvm_in,
             sdk_quote.in_amount.saturating_sub(litesvm_in)
         );
+
+        Ok(())
     }
 }
