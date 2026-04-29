@@ -1,8 +1,9 @@
 use anchor_lang::{AccountDeserialize, Discriminator};
 use byreal_clmm_common::PoolState;
 use byreal_clmm_jupiter_integration::{ByrealClmm, BYREAL_CLMM_PROGRAM};
-use jupiter_amm_interface::{Amm, AmmContext, KeyedAccount, QuoteParams, SwapMode, SwapParams};
+use jupiter_amm_interface::{Amm, AmmContext, ClockRef, KeyedAccount, QuoteParams, SwapMode, SwapParams};
 use solana_sdk::{account::Account, pubkey::Pubkey};
+use std::sync::atomic::Ordering;
 
 #[cfg(feature = "dynamic-pool")]
 #[test]
@@ -129,13 +130,9 @@ fn dynamic_test_amm() -> (ByrealClmm, PoolState) {
         },
         params: None,
     };
-    let amm = ByrealClmm::from_keyed_account(
-        &keyed_account,
-        &AmmContext {
-            clock_ref: Default::default(),
-        },
-    )
-    .unwrap();
+    let clock_ref = ClockRef::default();
+    clock_ref.unix_timestamp.store(1, Ordering::Relaxed);
+    let amm = ByrealClmm::from_keyed_account(&keyed_account, &AmmContext { clock_ref }).unwrap();
 
     (amm, pool_state)
 }
@@ -178,6 +175,26 @@ fn dynamic_update_account_map(
             lamports: 1_000_000,
             data: amm_config_account_data(&byreal_clmm_common::AmmConfig::default()),
             owner: BYREAL_CLMM_PROGRAM,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    account_map.insert(
+        pool_state.token_mint_0,
+        Account {
+            lamports: 1_000_000,
+            data: Vec::new(),
+            owner: spl_token::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    account_map.insert(
+        pool_state.token_mint_1,
+        Account {
+            lamports: 1_000_000,
+            data: Vec::new(),
+            owner: spl_token::id(),
             executable: false,
             rent_epoch: 0,
         },

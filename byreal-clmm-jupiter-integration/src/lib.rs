@@ -13,7 +13,10 @@ use jupiter_amm_interface::{
     SwapMode, SwapParams,
 };
 use spl_token::solana_program::program_pack::Pack;
-use spl_token_2022::{extension::StateWithExtensions, state::Account as Token2022Account};
+use spl_token_2022::{
+    extension::{transfer_fee::TransferFeeConfig, BaseStateWithExtensions, StateWithExtensions},
+    state::{Account as Token2022Account, Mint as Token2022Mint},
+};
 
 use byreal_clmm_common::{
     AmmConfig, ByrealClmmAmm, DynamicTickArrayState, PoolState, TickArrayBitmapExtension,
@@ -90,14 +93,40 @@ fn decode_pyth_price(data: &[u8], expected_feed_id: &[u8; 32]) -> Result<Price> 
         .map_err(|e| anyhow!("pyth feed id mismatch: {e}"))
 }
 
+fn decode_transfer_fee_config(owner: &Pubkey, data: &[u8]) -> Result<Option<TransferFeeConfig>> {
+    if *owner == spl_token::id() {
+        return Ok(None);
+    }
+    if *owner == spl_token_2022::id() {
+        let mint = StateWithExtensions::<Token2022Mint>::unpack(data)
+            .map_err(|e| anyhow!("decode token-2022 mint failed: {e}"))?;
+        return Ok(mint.get_extension::<TransferFeeConfig>().ok().copied());
+    }
+    Err(anyhow!("unsupported token mint owner: {owner}"))
+}
+
 #[derive(Clone)]
 pub struct ByrealClmm {
     key: Pubkey,
     amm: ByrealClmmAmm,
     timestamp: Arc<AtomicI64>,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ByrealClmm {
+    fn swap_direction_for_mints(&self, source_mint: Pubkey, destination_mint: Pubkey) -> Result<bool> {
+        match (
+            source_mint == self.amm.pool_state.token_mint_0,
+            source_mint == self.amm.pool_state.token_mint_1,
+            destination_mint == self.amm.pool_state.token_mint_0,
+            destination_mint == self.amm.pool_state.token_mint_1,
+        ) {
+            (true, false, false, true) => Ok(true),
+            (false, true, true, false) => Ok(false),
+            _ => Err(anyhow!("swap mints do not match pool reserves")),
+        }
+    }
+
     fn live_directional_tick_arrays(&self, zero_for_one: bool) -> Result<Vec<Pubkey>> {
         let candidate_tick_arrays = self.amm.get_swap_tick_arrays(zero_for_one);
         let mut live_tick_arrays = Vec::new();
@@ -123,16 +152,8 @@ impl ByrealClmm {
         &self,
         swap_params: &SwapParams,
     ) -> Result<Vec<AccountMeta>> {
-        let zero_for_one = match (
-            swap_params.source_mint == self.amm.pool_state.token_mint_0,
-            swap_params.source_mint == self.amm.pool_state.token_mint_1,
-            swap_params.destination_mint == self.amm.pool_state.token_mint_0,
-            swap_params.destination_mint == self.amm.pool_state.token_mint_1,
-        ) {
-            (true, false, false, true) => true,
-            (false, true, true, false) => false,
-            _ => return Err(anyhow!("swap mints do not match pool reserves")),
-        };
+        let zero_for_one =
+            self.swap_direction_for_mints(swap_params.source_mint, swap_params.destination_mint)?;
 
         let (token0_pyth_oracle, token1_pyth_oracle) =
             get_dynamic_pyth_oracle_addresses(&self.amm.pool_state)?;
@@ -201,8 +222,11 @@ impl Amm for ByrealClmm {
                 token1_vault_amount: 0,
                 token0_pyth_price: None,
                 token1_pyth_price: None,
+                token0_transfer_fee_config: None,
+                token1_transfer_fee_config: None,
             },
             timestamp: amm_context.clock_ref.unix_timestamp.clone(),
+            epoch: amm_context.clock_ref.epoch.clone(),
         })
     }
 
@@ -229,6 +253,8 @@ impl Amm for ByrealClmm {
         let mut accounts = vec![
             self.key, // Pool state itself
             self.amm.pool_state.amm_config,
+            self.amm.pool_state.token_mint_0,
+            self.amm.pool_state.token_mint_1,
         ];
 
         let bitmap_key = TickArrayBitmapExtension::key(self.key);
@@ -259,6 +285,15 @@ impl Amm for ByrealClmm {
             account_map,
             &self.amm.pool_state.amm_config,
         )?)?;
+
+        let (mint0_data, mint0_owner) =
+            try_get_account_data_and_owner(account_map, &self.amm.pool_state.token_mint_0)?;
+        self.amm.token0_transfer_fee_config =
+            decode_transfer_fee_config(mint0_owner, mint0_data)?;
+        let (mint1_data, mint1_owner) =
+            try_get_account_data_and_owner(account_map, &self.amm.pool_state.token_mint_1)?;
+        self.amm.token1_transfer_fee_config =
+            decode_transfer_fee_config(mint1_owner, mint1_data)?;
 
         // Update bitmap extension
         let bitmap_key = TickArrayBitmapExtension::key(self.key);
@@ -324,11 +359,9 @@ impl Amm for ByrealClmm {
         }
 
         let current_timestamp = self.timestamp.load(std::sync::atomic::Ordering::Relaxed);
-        ensure!(
-            current_timestamp as u64 >= self.amm.pool_state.open_time,
-            "Pool is not open yet"
-        );
-        let zero_for_one = quote_params.input_mint == self.amm.pool_state.token_mint_0;
+        let current_epoch = self.epoch.load(std::sync::atomic::Ordering::Relaxed);
+        let zero_for_one =
+            self.swap_direction_for_mints(quote_params.input_mint, quote_params.output_mint)?;
 
         let is_base_input = quote_params.swap_mode == SwapMode::ExactIn;
         let swap_result = self.amm.compute_swap(
@@ -337,6 +370,7 @@ impl Amm for ByrealClmm {
             is_base_input,
             None, // No price limit for quotes
             current_timestamp,
+            current_epoch,
         )?;
 
         Ok(Quote {
@@ -359,7 +393,8 @@ impl Amm for ByrealClmm {
             });
         }
 
-        let zero_for_one = swap_params.source_mint == self.amm.pool_state.token_mint_0;
+        let zero_for_one =
+            self.swap_direction_for_mints(swap_params.source_mint, swap_params.destination_mint)?;
 
         // Build account metas for swap instruction (must match on-chain order)
         let mut account_metas = vec![
@@ -481,8 +516,11 @@ mod tests {
                 token1_vault_amount: 0,
                 token0_pyth_price: None,
                 token1_pyth_price: None,
+                token0_transfer_fee_config: None,
+                token1_transfer_fee_config: None,
             },
             timestamp: Arc::new(AtomicI64::new(0)),
+            epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -508,8 +546,11 @@ mod tests {
                 token1_vault_amount: 0,
                 token0_pyth_price: None,
                 token1_pyth_price: None,
+                token0_transfer_fee_config: None,
+                token1_transfer_fee_config: None,
             },
             timestamp: Arc::new(AtomicI64::new(0)),
+            epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         let quote_err = amm
@@ -549,6 +590,47 @@ mod tests {
 
         let err = get_dynamic_pyth_oracle_addresses(&amm.amm.pool_state).unwrap_err();
         assert!(format!("{err:#}").contains("dynamic pool token0 pyth feed id is zero"));
+    }
+
+    #[test]
+    fn test_quote_rejects_mints_outside_pool_reserves() {
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.set_swap_dynamic_fee_enabled(false);
+
+        let err = amm
+            .quote(&QuoteParams {
+                amount: 1,
+                input_mint: Pubkey::new_unique(),
+                output_mint: amm.amm.pool_state.token_mint_1,
+                swap_mode: SwapMode::ExactIn,
+            })
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("swap mints do not match pool reserves"));
+    }
+
+    #[test]
+    fn test_non_dynamic_swap_metas_reject_mints_outside_pool_reserves() {
+        let mut amm = build_dynamic_test_amm();
+        amm.amm.pool_state.set_swap_dynamic_fee_enabled(false);
+        let jupiter_program = Pubkey::new_unique();
+
+        let err = match amm.get_swap_and_account_metas(&SwapParams {
+            source_mint: Pubkey::new_unique(),
+            destination_mint: amm.amm.pool_state.token_mint_1,
+            source_token_account: Pubkey::new_unique(),
+                destination_token_account: Pubkey::new_unique(),
+                token_transfer_authority: Pubkey::new_unique(),
+                quote_mint_to_referrer: None,
+                jupiter_program_id: &jupiter_program,
+                in_amount: 1,
+            out_amount: 1,
+            missing_dynamic_accounts_as_default: false,
+            swap_mode: SwapMode::ExactIn,
+        }) {
+            Ok(_) => panic!("swap metas should reject mints outside pool reserves"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:#}").contains("swap mints do not match pool reserves"));
     }
 
     #[test]

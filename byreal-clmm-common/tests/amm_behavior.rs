@@ -18,6 +18,8 @@ fn empty_amm(pool_key: Pubkey, pool_state: PoolState) -> ByrealClmmAmm {
         token1_vault_amount: 0,
         token0_pyth_price: None,
         token1_pyth_price: None,
+        token0_transfer_fee_config: None,
+        token1_transfer_fee_config: None,
     }
 }
 
@@ -162,5 +164,5 @@ fn compute_swap_errors_when_not_enough_tick_arrays() {
     let mut amm = empty_amm(Pubkey::new_unique(), pool_state);
     amm.bitmap_extension = Some(TickArrayBitmapExtension::default());
 
-    assert!(amm.compute_swap(true, 1_000u64, true, None, 0).is_err());
+    assert!(amm.compute_swap(true, 1_000u64, true, None, 0, 0).is_err());
 }

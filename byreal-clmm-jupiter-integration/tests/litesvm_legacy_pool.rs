@@ -553,6 +553,8 @@ fn load_pool(rpc: &RpcClient, pool_address: Pubkey, expected_program: Pubkey) ->
         token1_vault_amount: 0,
         token0_pyth_price: None,
         token1_pyth_price: None,
+        token0_transfer_fee_config: None,
+        token1_transfer_fee_config: None,
     };
     let mut full_tick_addrs = HashSet::new();
     for &dir in &[true, false] {
@@ -618,6 +620,8 @@ fn load_pool(rpc: &RpcClient, pool_address: Pubkey, expected_program: Pubkey) ->
         token1_vault_amount: 0,
         token0_pyth_price: None,
         token1_pyth_price: None,
+        token0_transfer_fee_config: None,
+        token1_transfer_fee_config: None,
     };
 
     Ok(LoadedPool {
