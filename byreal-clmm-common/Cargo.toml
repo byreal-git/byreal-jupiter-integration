@@ -11,7 +11,7 @@ solana-sdk = "2.3.0"
 solana-program = "2.3.0"
 
 # Raydium dependencies
-byreal-clmm = { path = "../../solana-dex-clmm/programs/amm", features = ["no-entrypoint"] }
+byreal-clmm = { git = "https://github.com/byreal-git/byreal-clmm", rev = "6863b33fd0f7874f722e58fe8191009b6061de5d", features = ["no-entrypoint"] }
 bytemuck = { version = "1", features = ["derive"] }
 pyth-solana-receiver-sdk = "=1.0.0"
 spl-token = "7.0.0"
