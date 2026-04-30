@@ -36,12 +36,20 @@ const MAINNET_CBBTC_MINT: Pubkey =
     solana_sdk::pubkey!("cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij");
 const MAINNET_TSLAX_MINT: Pubkey =
     solana_sdk::pubkey!("XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB");
+const MAINNET_TSLAX_LARGE_AMOUNT: u64 = 50_000_000;
+const MAINNET_USDC_LARGE_AMOUNT: u64 = 150_000_000;
 #[cfg(feature = "dynamic-pool")]
 const DYNAMIC_JUP_USDC_POOL: Pubkey =
     solana_sdk::pubkey!("DCiq2T2tMxdRgoQ2jQ9JhCNaMU5TxsPdrCa7esSCvxiw");
 #[cfg(feature = "dynamic-pool")]
 const JUP_MINT: Pubkey =
     solana_sdk::pubkey!("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN");
+#[cfg(feature = "dynamic-pool")]
+const DYNAMIC_JUP_LARGE_AMOUNT: u64 = 25_000_000;
+#[cfg(feature = "dynamic-pool")]
+const DYNAMIC_USDC_INPUT_AMOUNT: u64 = 10_000_000;
+#[cfg(feature = "dynamic-pool")]
+const DYNAMIC_USDC_OUTPUT_AMOUNT: u64 = 3_000_000;
 static LIVE_RPC_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct LoadedPool {
@@ -328,7 +336,7 @@ fn litesvm_vs_sdk_mainnet_tslax_usdc_exact_in() {
     let loaded = load_pool(&rpc, MAINNET_TSLAX_USDC_POOL, MAINNET_PROGRAM).unwrap();
     assert_mainnet_pair(&loaded, MAINNET_TSLAX_MINT, MAINNET_USDC_MINT, "TSLAx-USDC");
     assert!(!loaded.common_amm.pool_state.is_swap_dynamic_fee_enabled());
-    let amount_in = 1_000_000u64;
+    let amount_in = MAINNET_TSLAX_LARGE_AMOUNT;
 
     let sdk_quote = loaded
         .adapter
@@ -387,7 +395,7 @@ fn litesvm_vs_sdk_mainnet_tslax_usdc_exact_out() {
     let loaded = load_pool(&rpc, MAINNET_TSLAX_USDC_POOL, MAINNET_PROGRAM).unwrap();
     assert_mainnet_pair(&loaded, MAINNET_TSLAX_MINT, MAINNET_USDC_MINT, "TSLAx-USDC");
     assert!(!loaded.common_amm.pool_state.is_swap_dynamic_fee_enabled());
-    let desired_out = 1_000_000u64;
+    let desired_out = MAINNET_USDC_LARGE_AMOUNT;
 
     let sdk_quote = loaded
         .adapter
@@ -429,6 +437,262 @@ fn litesvm_vs_sdk_mainnet_tslax_usdc_exact_out() {
     assert_eq!(sim_result.destination_amount, desired_out);
 }
 
+#[test]
+#[ignore]
+fn litesvm_vs_sdk_mainnet_usdc_tslax_exact_in() {
+    let _guard = LIVE_RPC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if BYREAL_CLMM_PROGRAM != MAINNET_PROGRAM {
+        println!("Skipping mainnet TSLAx pool LiteSVM test: compile with --features \"mainnet with-litesvm\"");
+        return;
+    }
+    if cfg!(feature = "dynamic-pool") {
+        println!("Skipping current mainnet TSLAx swap_v3_dyn test: mainnet program is not upgraded yet");
+        return;
+    }
+
+    let rpc = RpcClient::new("https://api.mainnet-beta.solana.com");
+    let loaded = load_pool(&rpc, MAINNET_TSLAX_USDC_POOL, MAINNET_PROGRAM).unwrap();
+    assert_mainnet_pair(&loaded, MAINNET_TSLAX_MINT, MAINNET_USDC_MINT, "TSLAx-USDC");
+    assert!(!loaded.common_amm.pool_state.is_swap_dynamic_fee_enabled());
+    let amount_in = MAINNET_USDC_LARGE_AMOUNT;
+
+    let sdk_quote = loaded
+        .adapter
+        .quote(&QuoteParams {
+            amount: amount_in,
+            input_mint: MAINNET_USDC_MINT,
+            output_mint: MAINNET_TSLAX_MINT,
+            swap_mode: SwapMode::ExactIn,
+        })
+        .unwrap();
+    println!(
+        "Mainnet USDC->TSLAx SDK quote: in={}, out={}, fee={}",
+        sdk_quote.in_amount, sdk_quote.out_amount, sdk_quote.fee_amount
+    );
+
+    let sim_result = simulate_configured_swap(
+        &rpc,
+        &loaded,
+        MAINNET_USDC_MINT,
+        MAINNET_TSLAX_MINT,
+        amount_in,
+        0,
+        true,
+        amount_in.saturating_mul(2),
+    )
+    .unwrap();
+    println!(
+        "Mainnet USDC->TSLAx LiteSVM out={}, diff (sdk_math - litesvm)={}",
+        sim_result.destination_amount,
+        sdk_quote.out_amount.saturating_sub(sim_result.destination_amount)
+    );
+
+    assert_amounts_close(
+        "mainnet USDC->TSLAx exact-in output amount",
+        sdk_quote.out_amount,
+        sim_result.destination_amount,
+    );
+}
+
+#[test]
+#[ignore]
+fn litesvm_vs_sdk_mainnet_usdc_tslax_exact_out() {
+    let _guard = LIVE_RPC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if BYREAL_CLMM_PROGRAM != MAINNET_PROGRAM {
+        println!("Skipping mainnet TSLAx pool LiteSVM test: compile with --features \"mainnet with-litesvm\"");
+        return;
+    }
+    if cfg!(feature = "dynamic-pool") {
+        println!("Skipping current mainnet TSLAx swap_v3_dyn test: mainnet program is not upgraded yet");
+        return;
+    }
+
+    let rpc = RpcClient::new("https://api.mainnet-beta.solana.com");
+    let loaded = load_pool(&rpc, MAINNET_TSLAX_USDC_POOL, MAINNET_PROGRAM).unwrap();
+    assert_mainnet_pair(&loaded, MAINNET_TSLAX_MINT, MAINNET_USDC_MINT, "TSLAx-USDC");
+    assert!(!loaded.common_amm.pool_state.is_swap_dynamic_fee_enabled());
+    let desired_out = MAINNET_TSLAX_LARGE_AMOUNT;
+
+    let sdk_quote = loaded
+        .adapter
+        .quote(&QuoteParams {
+            amount: desired_out,
+            input_mint: MAINNET_USDC_MINT,
+            output_mint: MAINNET_TSLAX_MINT,
+            swap_mode: SwapMode::ExactOut,
+        })
+        .unwrap();
+    println!(
+        "Mainnet USDC->TSLAx SDK exact-out quote: in={}, out={}, fee={}",
+        sdk_quote.in_amount, sdk_quote.out_amount, sdk_quote.fee_amount
+    );
+
+    let sim_result = simulate_configured_swap(
+        &rpc,
+        &loaded,
+        MAINNET_USDC_MINT,
+        MAINNET_TSLAX_MINT,
+        desired_out,
+        sdk_quote.in_amount,
+        false,
+        sdk_quote.in_amount.saturating_mul(2),
+    )
+    .unwrap();
+    println!(
+        "Mainnet USDC->TSLAx LiteSVM exact-out in={}, out={}, diff (sdk_in - litesvm_in)={}",
+        sim_result.source_debit,
+        sim_result.destination_amount,
+        sdk_quote.in_amount.saturating_sub(sim_result.source_debit)
+    );
+
+    assert_amounts_close(
+        "mainnet USDC->TSLAx exact-out input amount",
+        sdk_quote.in_amount,
+        sim_result.source_debit,
+    );
+    assert_eq!(sim_result.destination_amount, desired_out);
+}
+
+#[cfg(feature = "dynamic-pool")]
+#[test]
+#[ignore]
+fn mainnet_tslax_swap_v3_dyn_probe() {
+    let _guard = LIVE_RPC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if BYREAL_CLMM_PROGRAM != MAINNET_PROGRAM {
+        println!("Skipping mainnet TSLAx swap_v3_dyn probe: compile with --features \"mainnet dynamic-pool with-litesvm\"");
+        return;
+    }
+
+    let rpc = RpcClient::new("https://api.mainnet-beta.solana.com");
+    let loaded = load_pool(&rpc, MAINNET_TSLAX_USDC_POOL, MAINNET_PROGRAM).unwrap();
+    assert_mainnet_pair(&loaded, MAINNET_TSLAX_MINT, MAINNET_USDC_MINT, "TSLAx-USDC");
+    assert!(!loaded.common_amm.pool_state.is_swap_dynamic_fee_enabled());
+
+    for (label, input_mint, output_mint, amount, swap_mode) in [
+        (
+            "TSLAx->USDC exact-in",
+            MAINNET_TSLAX_MINT,
+            MAINNET_USDC_MINT,
+            MAINNET_TSLAX_LARGE_AMOUNT,
+            SwapMode::ExactIn,
+        ),
+        (
+            "TSLAx->USDC exact-out",
+            MAINNET_TSLAX_MINT,
+            MAINNET_USDC_MINT,
+            MAINNET_USDC_LARGE_AMOUNT,
+            SwapMode::ExactOut,
+        ),
+        (
+            "USDC->TSLAx exact-in",
+            MAINNET_USDC_MINT,
+            MAINNET_TSLAX_MINT,
+            MAINNET_USDC_LARGE_AMOUNT,
+            SwapMode::ExactIn,
+        ),
+        (
+            "USDC->TSLAx exact-out",
+            MAINNET_USDC_MINT,
+            MAINNET_TSLAX_MINT,
+            MAINNET_TSLAX_LARGE_AMOUNT,
+            SwapMode::ExactOut,
+        ),
+    ] {
+        match probe_mainnet_tslax_swap_v3_dyn_case(
+            &rpc,
+            &loaded,
+            label,
+            input_mint,
+            output_mint,
+            amount,
+            swap_mode,
+        ) {
+            Ok(()) => {}
+            Err(err) => {
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains("InstructionFallbackNotFound")
+                        || message.contains("Fallback functions are not supported"),
+                    "unexpected swap_v3_dyn probe failure in {label}: {message}"
+                );
+                println!("Mainnet TSLAx swap_v3_dyn probe confirms current program is not upgraded in {label}: {message}");
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "dynamic-pool")]
+fn probe_mainnet_tslax_swap_v3_dyn_case(
+    rpc: &RpcClient,
+    loaded: &LoadedPool,
+    label: &str,
+    input_mint: Pubkey,
+    output_mint: Pubkey,
+    amount: u64,
+    swap_mode: SwapMode,
+) -> Result<()> {
+    let sdk_quote = loaded.adapter.quote(&QuoteParams {
+        amount,
+        input_mint,
+        output_mint,
+        swap_mode,
+    })?;
+    let is_base_input = swap_mode == SwapMode::ExactIn;
+    let other_amount_threshold = if is_base_input { 0 } else { sdk_quote.in_amount };
+    let source_balance = if is_base_input {
+        amount.saturating_mul(2)
+    } else {
+        sdk_quote.in_amount.saturating_mul(2)
+    };
+
+    let sim_result = simulate_swap_v3_dyn(
+        rpc,
+        loaded,
+        input_mint,
+        output_mint,
+        amount,
+        other_amount_threshold,
+        is_base_input,
+        source_balance,
+    )?;
+
+    if is_base_input {
+        println!(
+            "Mainnet TSLAx swap_v3_dyn upgraded {label}: sdk_out={}, litesvm_out={}, diff={}",
+            sdk_quote.out_amount,
+            sim_result.destination_amount,
+            sdk_quote.out_amount.saturating_sub(sim_result.destination_amount)
+        );
+        assert_amounts_close(
+            &format!("mainnet TSLAx swap_v3_dyn probe {label} output amount"),
+            sdk_quote.out_amount,
+            sim_result.destination_amount,
+        );
+    } else {
+        println!(
+            "Mainnet TSLAx swap_v3_dyn upgraded {label}: sdk_in={}, litesvm_in={}, out={}",
+            sdk_quote.in_amount,
+            sim_result.source_debit,
+            sim_result.destination_amount,
+        );
+        assert_amounts_close(
+            &format!("mainnet TSLAx swap_v3_dyn probe {label} input amount"),
+            sdk_quote.in_amount,
+            sim_result.source_debit,
+        );
+        assert_eq!(sim_result.destination_amount, amount);
+    }
+
+    Ok(())
+}
+
 #[cfg(feature = "dynamic-pool")]
 #[test]
 #[ignore]
@@ -444,7 +708,7 @@ fn litesvm_vs_sdk_dynamic_jup_usdc_exact_in() {
     let rpc = RpcClient::new("https://api.mainnet-beta.solana.com");
     let loaded = load_pool(&rpc, DYNAMIC_JUP_USDC_POOL, LEGACY_PROGRAM).unwrap();
     assert!(loaded.common_amm.pool_state.is_swap_dynamic_fee_enabled());
-    let amount_in = 1_000_000u64;
+    let amount_in = DYNAMIC_USDC_INPUT_AMOUNT;
 
     let sdk_quote = loaded
         .adapter
@@ -499,7 +763,7 @@ fn litesvm_vs_sdk_dynamic_jup_usdc_exact_out() {
     let rpc = RpcClient::new("https://api.mainnet-beta.solana.com");
     let loaded = load_pool(&rpc, DYNAMIC_JUP_USDC_POOL, LEGACY_PROGRAM).unwrap();
     assert!(loaded.common_amm.pool_state.is_swap_dynamic_fee_enabled());
-    let desired_out = 1_000_000u64;
+    let desired_out = DYNAMIC_JUP_LARGE_AMOUNT;
 
     let sdk_quote = loaded
         .adapter
@@ -556,7 +820,7 @@ fn litesvm_vs_sdk_dynamic_jup_usdc_reverse_exact_in() {
     let rpc = RpcClient::new("https://api.mainnet-beta.solana.com");
     let loaded = load_pool(&rpc, DYNAMIC_JUP_USDC_POOL, LEGACY_PROGRAM).unwrap();
     assert!(loaded.common_amm.pool_state.is_swap_dynamic_fee_enabled());
-    let amount_in = 1_000_000u64;
+    let amount_in = DYNAMIC_JUP_LARGE_AMOUNT;
 
     let sdk_quote = loaded
         .adapter
@@ -611,7 +875,7 @@ fn litesvm_vs_sdk_dynamic_jup_usdc_reverse_exact_out() {
     let rpc = RpcClient::new("https://api.mainnet-beta.solana.com");
     let loaded = load_pool(&rpc, DYNAMIC_JUP_USDC_POOL, LEGACY_PROGRAM).unwrap();
     assert!(loaded.common_amm.pool_state.is_swap_dynamic_fee_enabled());
-    let desired_out = 1_000_000u64;
+    let desired_out = DYNAMIC_USDC_OUTPUT_AMOUNT;
 
     let sdk_quote = loaded
         .adapter
