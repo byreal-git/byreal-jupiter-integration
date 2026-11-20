@@ -2,6 +2,12 @@
 
 This module implements the `Amm` trait defined [here](https://github.com/jup-ag/rust-amm-implementation).
 
+Enable dynamic-fee pools with `--features dynamic-pool`. Both nonzero Pyth feed IDs
+require their shard 0 oracle accounts. If either feed ID is zero, or an oracle
+price is older than 3600 seconds or non-positive, or the computed price index is zero, only the
+arbitrage fee is skipped. Base, trade-slippage, and imbalance fees still apply.
+Missing or invalid oracle accounts remain errors when both feeds are configured.
+
 To test, simply run:
 
 ```
