@@ -52,6 +52,451 @@ const DYNAMIC_USDC_INPUT_AMOUNT: u64 = 10_000_000;
 const DYNAMIC_USDC_OUTPUT_AMOUNT: u64 = 3_000_000;
 static LIVE_RPC_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(feature = "dynamic-pool")]
+mod local_pyth_policy {
+    use super::*;
+    use anchor_lang::{AccountSerialize, Discriminator};
+    use byreal_clmm_common::TickArrayState;
+    use pyth_solana_receiver_sdk::price_update::{
+        PriceFeedMessage, PriceUpdateV2, VerificationLevel,
+    };
+
+    fn require_local_program() -> Result<RpcClient> {
+        ensure!(
+            std::env::var_os("BYREAL_CLMM_PROGRAM_SO").is_some(),
+            "set BYREAL_CLMM_PROGRAM_SO to the rebuilt optional-Pyth CLMM binary"
+        );
+        // All fixture accounts are local; any accidental RPC access must fail.
+        Ok(RpcClient::new("http://127.0.0.1:1"))
+    }
+
+    #[test]
+    #[ignore = "requires a rebuilt CLMM binary via BYREAL_CLMM_PROGRAM_SO"]
+    fn litesvm_local_pyth_policy_matches_quotes() -> Result<()> {
+        let rpc = require_local_program()?;
+        for case in [
+            "no-feeds",
+            "no-token0-feed",
+            "no-token1-feed",
+            "fresh",
+            "age-3600",
+            "stale-token0",
+            "stale-token1",
+            "zero-token0",
+            "negative-token1",
+            "rounded-zero",
+        ] {
+            let loaded = local_pool(case)?;
+            let pool = &loaded.common_amm.pool_state;
+            let requires_pyth =
+                pool.token0_pyth_feed_id != [0; 32] && pool.token1_pyth_feed_id != [0; 32];
+            for zero_for_one in [true, false] {
+                let (input_mint, output_mint) = if zero_for_one {
+                    (pool.token_mint_0, pool.token_mint_1)
+                } else {
+                    (pool.token_mint_1, pool.token_mint_0)
+                };
+                for swap_mode in [SwapMode::ExactIn, SwapMode::ExactOut] {
+                    let quote = loaded.adapter.quote(&QuoteParams {
+                        amount: 200_000_000,
+                        input_mint,
+                        output_mint,
+                        swap_mode,
+                    })?;
+                    let jupiter_program = Pubkey::new_unique();
+                    let metas = loaded
+                        .adapter
+                        .get_swap_and_account_metas(&SwapParams {
+                            source_mint: input_mint,
+                            destination_mint: output_mint,
+                            source_token_account: Pubkey::new_unique(),
+                            destination_token_account: Pubkey::new_unique(),
+                            token_transfer_authority: Pubkey::new_unique(),
+                            quote_mint_to_referrer: None,
+                            jupiter_program_id: &jupiter_program,
+                            in_amount: quote.in_amount,
+                            out_amount: quote.out_amount,
+                            missing_dynamic_accounts_as_default: false,
+                            swap_mode,
+                        })?
+                        .account_metas;
+                    assert_eq!(
+                        metas.len(),
+                        (if zero_for_one { 16 } else { 15 }) + if requires_pyth { 2 } else { 0 },
+                        "{case}: tick arrays and Pyth account count"
+                    );
+                    if requires_pyth {
+                        let tail = &metas[metas.len() - 2..];
+                        assert_eq!(tail[0].pubkey, oracle_address(&pool.token0_pyth_feed_id));
+                        assert_eq!(tail[1].pubkey, oracle_address(&pool.token1_pyth_feed_id));
+                    }
+                    let is_base_input = swap_mode == SwapMode::ExactIn;
+                    let sim = simulate_configured_swap(
+                        &rpc,
+                        &loaded,
+                        input_mint,
+                        output_mint,
+                        200_000_000,
+                        if is_base_input {
+                            quote.out_amount
+                        } else {
+                            quote.in_amount
+                        },
+                        is_base_input,
+                        quote.in_amount + 1_000_000_000,
+                    )?;
+                    for (label, expected, actual) in [
+                        ("input", quote.in_amount, sim.source_debit),
+                        ("output", quote.out_amount, sim.destination_amount),
+                        ("fee", quote.fee_amount, sim.fee_amount),
+                    ] {
+                        assert!(
+                            expected.abs_diff(actual) <= 1,
+                            "{case}/{zero_for_one}/{swap_mode:?}: {label} expected={expected}, actual={actual}"
+                        );
+                    }
+                    if !matches!(case, "fresh" | "age-3600") {
+                        // 1000 base + 10 slippage + (25 selling / 0 buying) imbalance.
+                        let expected_rate: u32 = if zero_for_one { 1035 } else { 1010 };
+                        assert_eq!(quote.fee_pct, expected_rate.into(), "{case}");
+                    } else {
+                        assert!(quote.fee_pct > 1035u32.into(), "arbitrage fee must apply");
+                    }
+                    println!(
+                        "{case}/{zero_for_one}/{swap_mode:?}: in={}, out={}, fee={}, rate={} ppm",
+                        sim.source_debit, sim.destination_amount, sim.fee_amount, quote.fee_pct
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a rebuilt CLMM binary via BYREAL_CLMM_PROGRAM_SO"]
+    fn litesvm_local_pyth_invalid_accounts_and_fee_cap_fail() -> Result<()> {
+        let rpc = require_local_program()?;
+        for case in [
+            "missing",
+            "owner",
+            "feed",
+            "data",
+            "stale-invalid-peer",
+            "fee-cap",
+            "overflow",
+        ] {
+            let mut loaded = local_pool(if case == "fee-cap" {
+                "no-feeds"
+            } else {
+                "fresh"
+            })?;
+            let pool = loaded.common_amm.pool_state;
+            let oracle0 = oracle_address(&pool.token0_pyth_feed_id);
+            let oracle1 = oracle_address(&pool.token1_pyth_feed_id);
+            let expected_error = match case {
+                "missing" => {
+                    loaded.account_map.remove(&oracle0);
+                    "InvalidPythOracleAccount"
+                }
+                "owner" => {
+                    loaded.account_map.get_mut(&oracle0).unwrap().owner = spl_token::ID;
+                    "InvalidPythOracleAccount"
+                }
+                "feed" => {
+                    let data = price_data([3; 32], (2_000_000, -6, 100))?;
+                    loaded.account_map.get_mut(&oracle0).unwrap().data = data;
+                    "InvalidPythOracleAccount"
+                }
+                "data" => {
+                    loaded.account_map.get_mut(&oracle0).unwrap().data = vec![0; 8];
+                    "AccountDiscriminatorMismatch"
+                }
+                "stale-invalid-peer" => {
+                    loaded.swap_timestamp = 3701;
+                    loaded.account_map.get_mut(&oracle1).unwrap().owner = spl_token::ID;
+                    "InvalidPythOracleAccount"
+                }
+                "fee-cap" => {
+                    let config = AmmConfig {
+                        trade_fee_rate: 999_999,
+                        ..Default::default()
+                    };
+                    let mut data = Vec::new();
+                    config.try_serialize(&mut data)?;
+                    loaded.account_map.get_mut(&pool.amm_config).unwrap().data = data;
+                    "InvalidSwapDynamicFeeParams"
+                }
+                "overflow" => {
+                    let data = price_data(pool.token0_pyth_feed_id, (1, i32::MIN, 100))?;
+                    loaded.account_map.get_mut(&oracle0).unwrap().data = data;
+                    "CalculateOverflow"
+                }
+                _ => unreachable!(),
+            };
+            let update = loaded.adapter.update(&loaded.account_map);
+            if matches!(case, "fee-cap" | "overflow") {
+                update?;
+                assert!(
+                    loaded
+                        .adapter
+                        .quote(&QuoteParams {
+                            amount: 200_000_000,
+                            input_mint: pool.token_mint_0,
+                            output_mint: pool.token_mint_1,
+                            swap_mode: SwapMode::ExactIn,
+                        })
+                        .is_err(),
+                    "{case}: SDK must reject invalid arithmetic"
+                );
+            } else {
+                assert!(update.is_err(), "{case}: SDK must reject invalid oracle");
+            }
+            let error = simulate_configured_swap(
+                &rpc,
+                &loaded,
+                pool.token_mint_0,
+                pool.token_mint_1,
+                200_000_000,
+                0,
+                true,
+                1_000_000_000,
+            )
+            .err()
+            .ok_or_else(|| anyhow!("{case}: CLMM incorrectly accepted invalid swap"))?;
+            assert!(
+                error.to_string().contains(expected_error),
+                "{case}: {error}"
+            );
+            println!("{case}: SDK and CLMM reject ({expected_error})");
+        }
+        Ok(())
+    }
+
+    fn oracle_address(feed_id: &[u8; 32]) -> Pubkey {
+        Pubkey::find_program_address(
+            &[&0u16.to_le_bytes(), feed_id],
+            &pyth_solana_receiver_sdk::PYTH_PUSH_ORACLE_ID,
+        )
+        .0
+    }
+
+    fn price_data(
+        feed_id: [u8; 32],
+        (price, exponent, publish_time): (i64, i32, i64),
+    ) -> Result<Vec<u8>> {
+        let update = PriceUpdateV2 {
+            write_authority: Pubkey::new_unique(),
+            verification_level: VerificationLevel::Full,
+            price_message: PriceFeedMessage {
+                feed_id,
+                price,
+                exponent,
+                publish_time,
+                conf: 1,
+                prev_publish_time: publish_time - 1,
+                ema_price: price,
+                ema_conf: 1,
+            },
+            posted_slot: 1,
+        };
+        let mut data = Vec::new();
+        update.try_serialize(&mut data)?;
+        Ok(data)
+    }
+
+    fn local_pool(case: &str) -> Result<LoadedPool> {
+        let mut pool = PoolState {
+            amm_config: Pubkey::new_unique(),
+            token_mint_0: Pubkey::new_unique(),
+            token_mint_1: Pubkey::new_unique(),
+            token_vault_0: Pubkey::new_unique(),
+            token_vault_1: Pubkey::new_unique(),
+            tick_spacing: 1,
+            sqrt_price_x64: 1u128 << 64,
+            liquidity: 1_000_000_000_000_000,
+            mint_decimals_0: 6,
+            mint_decimals_1: 6,
+            token0_pyth_feed_id: [1; 32],
+            token1_pyth_feed_id: [2; 32],
+            trade_slippage_fee_base_milli_bp: 10,
+            trade_slippage_fee_trade_size_threshold: 1,
+            imbalance_fee_base_tenths_of_bp: 5,
+            ..Default::default()
+        };
+        let (pool_address, bump) = Pubkey::find_program_address(
+            &[
+                b"pool",
+                pool.amm_config.as_ref(),
+                pool.token_mint_0.as_ref(),
+                pool.token_mint_1.as_ref(),
+            ],
+            &BYREAL_CLMM_PROGRAM,
+        );
+        pool.bump = [bump];
+        pool.observation_key = Pubkey::find_program_address(
+            &[b"observation", pool_address.as_ref()],
+            &BYREAL_CLMM_PROGRAM,
+        )
+        .0;
+        pool.set_quote_token_flag(true);
+        pool.set_swap_dynamic_fee_enabled(true);
+        pool.flip_tick_array_bit_internal(0)?;
+        pool.flip_tick_array_bit_internal(-60)?;
+        let mut prices = [(2_000_000, -6, 100), (1_000_000, -6, 100)];
+        let mut swap_timestamp = 200;
+        match case {
+            "no-feeds" => {
+                pool.token0_pyth_feed_id = [0; 32];
+                pool.token1_pyth_feed_id = [0; 32];
+            }
+            "no-token0-feed" => pool.token0_pyth_feed_id = [0; 32],
+            "no-token1-feed" => pool.token1_pyth_feed_id = [0; 32],
+            "fresh" => {}
+            "age-3600" => swap_timestamp = 3700,
+            "stale-token0" => {
+                swap_timestamp = 3700;
+                prices[0].2 = 99;
+            }
+            "stale-token1" => {
+                swap_timestamp = 3700;
+                prices[1].2 = 99;
+            }
+            "zero-token0" => prices[0].0 = 0,
+            "negative-token1" => prices[1].0 = -1,
+            "rounded-zero" => prices[0] = (1, -30, 100),
+            _ => return Err(anyhow!("unknown local policy case {case}")),
+        }
+        let config = AmmConfig {
+            trade_fee_rate: 1000,
+            tick_spacing: 1,
+            ..Default::default()
+        };
+        let mut account_map = AccountMap::default();
+        let mut insert = |address, owner, data| {
+            account_map.insert(
+                address,
+                SdkAccount {
+                    lamports: 1_000_000_000,
+                    data,
+                    owner,
+                    executable: false,
+                    rent_epoch: 0,
+                }
+                .into(),
+            );
+        };
+        let mut pool_data = PoolState::DISCRIMINATOR.to_vec();
+        pool_data.extend_from_slice(bytemuck::bytes_of(&pool));
+        insert(pool_address, BYREAL_CLMM_PROGRAM, pool_data);
+        let mut config_data = Vec::new();
+        config.try_serialize(&mut config_data)?;
+        insert(pool.amm_config, BYREAL_CLMM_PROGRAM, config_data);
+        let bitmap = TickArrayBitmapExtension {
+            pool_id: pool_address,
+            ..Default::default()
+        };
+        let mut bitmap_data = TickArrayBitmapExtension::DISCRIMINATOR.to_vec();
+        bitmap_data.extend_from_slice(bytemuck::bytes_of(&bitmap));
+        insert(
+            TickArrayBitmapExtension::key(pool_address),
+            BYREAL_CLMM_PROGRAM,
+            bitmap_data,
+        );
+        // ObservationState: discriminator + initialized/u64/u16/pool + 100 observations + padding.
+        let mut observation = vec![0; 8 + 1 + 8 + 2 + 32 + 100 * 44 + 32];
+        observation[..8].copy_from_slice(
+            &solana_program::hash::hash(b"account:ObservationState").to_bytes()[..8],
+        );
+        observation[19..51].copy_from_slice(pool_address.as_ref());
+        insert(pool.observation_key, BYREAL_CLMM_PROGRAM, observation);
+        for (mint, vault, amount) in [
+            (pool.token_mint_0, pool.token_vault_0, 150_000_000_000),
+            (pool.token_mint_1, pool.token_vault_1, 50_000_000_000),
+        ] {
+            let state = spl_token::state::Mint {
+                decimals: 6,
+                is_initialized: true,
+                ..Default::default()
+            };
+            let mut data = vec![0; spl_token::state::Mint::LEN];
+            spl_token::state::Mint::pack(state, &mut data)?;
+            insert(mint, spl_token::ID, data);
+            insert(
+                vault,
+                spl_token::ID,
+                spl_token_account_data(mint, pool_address, amount),
+            );
+        }
+        for start in [0i32, -60] {
+            let mut array = TickArrayState {
+                pool_id: pool_address,
+                start_tick_index: start,
+                ..Default::default()
+            };
+            for tick in if start == 0 { vec![0, 1] } else { vec![-1] } {
+                let index = (tick - start) as usize;
+                array.ticks[index].tick = tick;
+                array.ticks[index].liquidity_gross = 1;
+                array.initialized_tick_count += 1;
+            }
+            let address = Pubkey::find_program_address(
+                &[b"tick_array", pool_address.as_ref(), &start.to_be_bytes()],
+                &BYREAL_CLMM_PROGRAM,
+            )
+            .0;
+            let mut data = TickArrayState::DISCRIMINATOR.to_vec();
+            data.extend_from_slice(bytemuck::bytes_of(&array));
+            insert(address, BYREAL_CLMM_PROGRAM, data);
+        }
+        if pool.token0_pyth_feed_id != [0; 32] && pool.token1_pyth_feed_id != [0; 32] {
+            for (feed_id, price) in [
+                (pool.token0_pyth_feed_id, prices[0]),
+                (pool.token1_pyth_feed_id, prices[1]),
+            ] {
+                insert(
+                    oracle_address(&feed_id),
+                    pyth_solana_receiver_sdk::ID,
+                    price_data(feed_id, price)?,
+                );
+            }
+        }
+        let clock_ref = ClockRef::default();
+        clock_ref
+            .unix_timestamp
+            .store(swap_timestamp, Ordering::Relaxed);
+        let mut adapter = ByrealClmm::from_keyed_account(
+            &KeyedAccount {
+                key: pool_address,
+                account: account_map[&pool_address].clone(),
+                params: None,
+            },
+            &AmmContext { clock_ref },
+        )?;
+        adapter.update(&account_map)?;
+        let common_amm = ByrealClmmAmm {
+            key: pool_address,
+            pool_state: pool,
+            amm_config: config,
+            bitmap_extension: Some(bitmap),
+            max_one_side_tick_arrays: 3,
+            dynamic_tick_arrays: HashMap::new(),
+            token0_vault_amount: 150_000_000_000,
+            token1_vault_amount: 50_000_000_000,
+            token0_pyth_price: None,
+            token1_pyth_price: None,
+            token0_transfer_fee_config: None,
+            token1_transfer_fee_config: None,
+        };
+        Ok(LoadedPool {
+            pool_address,
+            adapter,
+            common_amm,
+            account_map,
+            swap_timestamp,
+        })
+    }
+}
+
 struct LoadedPool {
     pool_address: Pubkey,
     adapter: ByrealClmm,
@@ -1076,6 +1521,8 @@ fn assert_mainnet_pair(loaded: &LoadedPool, mint_a: Pubkey, mint_b: Pubkey, labe
 struct SimResult {
     source_debit: u64,
     destination_amount: u64,
+    #[cfg(feature = "dynamic-pool")]
+    fee_amount: u64,
 }
 
 fn simulate_configured_swap(
@@ -1324,9 +1771,22 @@ fn simulate_swap_v3_dyn(
 
     let source_post = post_token_amount(&sim.post_accounts, source_token_account)?;
     let destination_post = post_token_amount(&sim.post_accounts, destination_token_account)?;
+    let pool_post = sim
+        .post_accounts
+        .iter()
+        .find(|(address, _)| address.to_bytes() == loaded.pool_address.to_bytes())
+        .ok_or_else(|| anyhow!("post pool account not found"))?;
+    let pool_after = PoolState::try_deserialize(&mut pool_post.1.data())?;
+    let pool_before = &loaded.common_amm.pool_state;
+    let fee_amount = if input_mint == pool_before.token_mint_0 {
+        pool_after.total_fees_token_0 - pool_before.total_fees_token_0
+    } else {
+        pool_after.total_fees_token_1 - pool_before.total_fees_token_1
+    };
     Ok(SimResult {
         source_debit: source_balance.saturating_sub(source_post),
         destination_amount: destination_post,
+        fee_amount,
     })
 }
 
@@ -1431,6 +1891,9 @@ fn decode_upgradeable_loader_state_prefix(
 }
 
 fn deployed_program_bytes(rpc: &RpcClient, program_id: &Pubkey) -> Result<Vec<u8>> {
+    if let Some(path) = std::env::var_os("BYREAL_CLMM_PROGRAM_SO") {
+        return Ok(std::fs::read(path)?);
+    }
     let program_account = rpc.get_account(program_id)?;
 
     if program_account.owner == solana_program::bpf_loader::id() {
