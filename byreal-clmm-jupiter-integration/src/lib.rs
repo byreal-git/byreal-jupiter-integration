@@ -54,17 +54,11 @@ fn get_price_feed_account_address(shard_id: u16, feed_id: &[u8; 32]) -> Pubkey {
     .0
 }
 
-fn get_dynamic_pyth_oracle_addresses(pool_state: &PoolState) -> Result<(Pubkey, Pubkey)> {
-    ensure!(
-        pool_state.token0_pyth_feed_id != [0u8; 32],
-        "dynamic pool token0 pyth feed id is zero"
-    );
-    ensure!(
-        pool_state.token1_pyth_feed_id != [0u8; 32],
-        "dynamic pool token1 pyth feed id is zero"
-    );
-
-    Ok((
+fn get_dynamic_pyth_oracle_addresses(pool_state: &PoolState) -> Option<(Pubkey, Pubkey)> {
+    if pool_state.token0_pyth_feed_id == [0; 32] || pool_state.token1_pyth_feed_id == [0; 32] {
+        return None;
+    }
+    Some((
         get_price_feed_account_address(PYTH_PRICE_SHARD_ID, &pool_state.token0_pyth_feed_id),
         get_price_feed_account_address(PYTH_PRICE_SHARD_ID, &pool_state.token1_pyth_feed_id),
     ))
@@ -114,7 +108,11 @@ pub struct ByrealClmm {
 }
 
 impl ByrealClmm {
-    fn swap_direction_for_mints(&self, source_mint: Pubkey, destination_mint: Pubkey) -> Result<bool> {
+    fn swap_direction_for_mints(
+        &self,
+        source_mint: Pubkey,
+        destination_mint: Pubkey,
+    ) -> Result<bool> {
         match (
             source_mint == self.amm.pool_state.token_mint_0,
             source_mint == self.amm.pool_state.token_mint_1,
@@ -155,10 +153,12 @@ impl ByrealClmm {
         let mut account_metas = self.build_swap_v2_account_metas(swap_params)?;
 
         if self.amm.pool_state.is_swap_dynamic_fee_enabled() {
-            let (token0_pyth_oracle, token1_pyth_oracle) =
-                get_dynamic_pyth_oracle_addresses(&self.amm.pool_state)?;
-            account_metas.push(AccountMeta::new_readonly(token0_pyth_oracle, false));
-            account_metas.push(AccountMeta::new_readonly(token1_pyth_oracle, false));
+            if let Some((token0_pyth_oracle, token1_pyth_oracle)) =
+                get_dynamic_pyth_oracle_addresses(&self.amm.pool_state)
+            {
+                account_metas.push(AccountMeta::new_readonly(token0_pyth_oracle, false));
+                account_metas.push(AccountMeta::new_readonly(token1_pyth_oracle, false));
+            }
         }
 
         Ok(account_metas)
@@ -273,7 +273,7 @@ impl Amm for ByrealClmm {
         if dynamic_enabled() && self.amm.pool_state.is_swap_dynamic_fee_enabled() {
             accounts.push(self.amm.pool_state.token_vault_0);
             accounts.push(self.amm.pool_state.token_vault_1);
-            if let Ok((token0_pyth_oracle, token1_pyth_oracle)) =
+            if let Some((token0_pyth_oracle, token1_pyth_oracle)) =
                 get_dynamic_pyth_oracle_addresses(&self.amm.pool_state)
             {
                 accounts.push(token0_pyth_oracle);
@@ -321,9 +321,6 @@ impl Amm for ByrealClmm {
         }
 
         if dynamic_enabled() && self.amm.pool_state.is_swap_dynamic_fee_enabled() {
-            let (token0_pyth_oracle, token1_pyth_oracle) =
-                get_dynamic_pyth_oracle_addresses(&self.amm.pool_state)?;
-
             let (vault0_data, vault0_owner) =
                 try_get_account_data_and_owner(account_map, &self.amm.pool_state.token_vault_0)?;
             self.amm.token0_vault_amount = decode_vault_amount(vault0_owner, vault0_data)?;
@@ -331,24 +328,31 @@ impl Amm for ByrealClmm {
                 try_get_account_data_and_owner(account_map, &self.amm.pool_state.token_vault_1)?;
             self.amm.token1_vault_amount = decode_vault_amount(vault1_owner, vault1_data)?;
 
-            let (pyth0_data, pyth0_owner) =
-                try_get_account_data_and_owner(account_map, &token0_pyth_oracle)?;
-            if *pyth0_owner != PYTH_RECEIVER_PROGRAM_ID {
-                return Err(anyhow!("token0 pyth oracle owner mismatch"));
+            if let Some((token0_pyth_oracle, token1_pyth_oracle)) =
+                get_dynamic_pyth_oracle_addresses(&self.amm.pool_state)
+            {
+                let (pyth0_data, pyth0_owner) =
+                    try_get_account_data_and_owner(account_map, &token0_pyth_oracle)?;
+                if *pyth0_owner != PYTH_RECEIVER_PROGRAM_ID {
+                    return Err(anyhow!("token0 pyth oracle owner mismatch"));
+                }
+                let (pyth1_data, pyth1_owner) =
+                    try_get_account_data_and_owner(account_map, &token1_pyth_oracle)?;
+                if *pyth1_owner != PYTH_RECEIVER_PROGRAM_ID {
+                    return Err(anyhow!("token1 pyth oracle owner mismatch"));
+                }
+                self.amm.token0_pyth_price = Some(decode_pyth_price(
+                    pyth0_data,
+                    &self.amm.pool_state.token0_pyth_feed_id,
+                )?);
+                self.amm.token1_pyth_price = Some(decode_pyth_price(
+                    pyth1_data,
+                    &self.amm.pool_state.token1_pyth_feed_id,
+                )?);
+            } else {
+                self.amm.token0_pyth_price = None;
+                self.amm.token1_pyth_price = None;
             }
-            let (pyth1_data, pyth1_owner) =
-                try_get_account_data_and_owner(account_map, &token1_pyth_oracle)?;
-            if *pyth1_owner != PYTH_RECEIVER_PROGRAM_ID {
-                return Err(anyhow!("token1 pyth oracle owner mismatch"));
-            }
-            self.amm.token0_pyth_price = Some(decode_pyth_price(
-                pyth0_data,
-                &self.amm.pool_state.token0_pyth_feed_id,
-            )?);
-            self.amm.token1_pyth_price = Some(decode_pyth_price(
-                pyth1_data,
-                &self.amm.pool_state.token1_pyth_feed_id,
-            )?);
         } else {
             self.amm.token0_vault_amount = 0;
             self.amm.token1_vault_amount = 0;
@@ -682,21 +686,19 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_pyth_oracle_addresses_reject_zero_feed_id() {
+    fn test_dynamic_pyth_oracle_addresses_omit_zero_feed_id() {
         let mut amm = build_dynamic_test_amm();
         amm.amm.pool_state.token0_pyth_feed_id = [0u8; 32];
 
-        let err = get_dynamic_pyth_oracle_addresses(&amm.amm.pool_state).unwrap_err();
-        assert!(format!("{err:#}").contains("dynamic pool token0 pyth feed id is zero"));
+        assert!(get_dynamic_pyth_oracle_addresses(&amm.amm.pool_state).is_none());
     }
 
     #[test]
-    fn test_dynamic_pyth_oracle_addresses_reject_token1_zero_feed_id() {
+    fn test_dynamic_pyth_oracle_addresses_omit_token1_zero_feed_id() {
         let mut amm = build_dynamic_test_amm();
         amm.amm.pool_state.token1_pyth_feed_id = [0u8; 32];
 
-        let err = get_dynamic_pyth_oracle_addresses(&amm.amm.pool_state).unwrap_err();
-        assert!(format!("{err:#}").contains("dynamic pool token1 pyth feed id is zero"));
+        assert!(get_dynamic_pyth_oracle_addresses(&amm.amm.pool_state).is_none());
     }
 
     #[cfg(feature = "dynamic-pool")]
@@ -742,20 +744,38 @@ mod tests {
 
     #[cfg(feature = "dynamic-pool")]
     #[test]
-    fn test_dynamic_pool_update_rejects_zero_feed_ids() {
-        let mut amm = build_dynamic_test_amm();
-        amm.amm.pool_state.token0_pyth_feed_id = [0u8; 32];
-        let account_map = base_update_account_map(amm.key, &amm.amm.pool_state);
+    fn test_dynamic_pool_update_without_pyth_clears_cached_prices_and_keeps_vaults() {
+        for (feed0, feed1) in [([0; 32], [0; 32]), ([0; 32], [2; 32]), ([1; 32], [0; 32])] {
+            let mut amm = build_dynamic_test_amm();
+            let (pyth0, pyth1) = get_dynamic_pyth_oracle_addresses(&amm.amm.pool_state).unwrap();
+            let mut account_map = dynamic_update_account_map(
+                amm.key,
+                &amm.amm.pool_state,
+                PYTH_RECEIVER_PROGRAM_ID,
+                [1; 32],
+                PYTH_RECEIVER_PROGRAM_ID,
+                [2; 32],
+            );
+            amm.update(&account_map).unwrap();
+            assert!(amm.amm.token0_pyth_price.is_some());
+            assert!(amm.amm.token1_pyth_price.is_some());
 
-        let err = amm.update(&account_map).unwrap_err();
-        assert!(format!("{err:#}").contains("dynamic pool token0 pyth feed id is zero"));
+            let mut pool = amm.amm.pool_state;
+            pool.token0_pyth_feed_id = feed0;
+            pool.token1_pyth_feed_id = feed1;
+            account_map.get_mut(&amm.key).unwrap().data = pool_state_account_data(&pool);
+            account_map.remove(&pyth0);
+            account_map.remove(&pyth1);
+            amm.update(&account_map).unwrap();
 
-        let mut amm = build_dynamic_test_amm();
-        amm.amm.pool_state.token1_pyth_feed_id = [0u8; 32];
-        let account_map = base_update_account_map(amm.key, &amm.amm.pool_state);
-
-        let err = amm.update(&account_map).unwrap_err();
-        assert!(format!("{err:#}").contains("dynamic pool token1 pyth feed id is zero"));
+            assert_eq!(amm.amm.token0_vault_amount, 1_000);
+            assert_eq!(amm.amm.token1_vault_amount, 1_000);
+            assert!(amm.amm.token0_pyth_price.is_none());
+            assert!(amm.amm.token1_pyth_price.is_none());
+            let required = amm.get_accounts_to_update();
+            assert!(!required.contains(&pyth0));
+            assert!(!required.contains(&pyth1));
+        }
     }
 
     #[cfg(feature = "dynamic-pool")]
@@ -1096,10 +1116,9 @@ mod tests {
         tick_array.ticks[1].liquidity_gross = 1;
         tick_array.initialized_tick_count = 1;
         let current_tick_array = amm.amm.get_tick_array_address(current_start);
-        amm.amm.dynamic_tick_arrays.insert(
-            current_tick_array,
-            DynamicTickArrayState::Fixed(tick_array),
-        );
+        amm.amm
+            .dynamic_tick_arrays
+            .insert(current_tick_array, DynamicTickArrayState::Fixed(tick_array));
 
         let quote = amm
             .quote(&QuoteParams {

@@ -4,6 +4,3 @@ members = [
     "byreal-clmm-common"
 ]
 resolver = "2"
-
-[workspace.package]
-edition = "2021"
